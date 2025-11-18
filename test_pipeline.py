@@ -157,6 +157,21 @@ class TreasuryWorkflow:
                 if proj.get("name") == self.project_name:
                     self.project = proj
                     print(f"[project] reusing existing project {self.project['id']} ({self.project['name']})")
+                    
+                    # Update date range if different
+                    current_start = proj.get("training_start_date")
+                    current_end = proj.get("training_end_date")
+                    if current_start != self.training_start or current_end != self.training_end:
+                        print(f"[project] updating date range: {current_start} to {current_end} → {self.training_start} to {self.training_end}")
+                        update_payload = {
+                            "training_start_date": self.training_start,
+                            "training_end_date": self.training_end,
+                        }
+                        self.project = self._request("PATCH", f"/api/v1/projects/{self.project['id']}", json=update_payload)
+                        print(f"[project] date range updated")
+                    else:
+                        print(f"[project] date range unchanged: {current_start} to {current_end}")
+                    
                     return
         except Exception as e:
             print(f"[project] could not check for existing projects: {e}")
@@ -204,7 +219,22 @@ class TreasuryWorkflow:
         n_regimes: int,
         poll_interval: int,
         timeout: int,
+        resume_from: str = None,
     ) -> None:
+        """
+        Train the model with auto-setup.
+        
+        Args:
+            n_regimes: Number of copula regimes
+            poll_interval: Seconds between status checks
+            timeout: Maximum seconds to wait
+            resume_from: Optional stage to resume from ('sample_generation', 'fitting', 'encoding', 'training')
+                        None = full pipeline (default)
+                        'sample_generation' = regenerate normalized samples
+                        'fitting' = refit encoding models (wavelet + PCA)
+                        'encoding' = re-encode samples with existing models
+                        'training' = only retrain copula (fastest)
+        """
         if not self.project:
             raise RuntimeError("Project must be created or specified before training")
         train_payload = {
@@ -222,6 +252,12 @@ class TreasuryWorkflow:
                 "splitPercentages": self.sample_config["splitPercentages"],
             },
         }
+        
+        # Add resume_from if specified
+        if resume_from:
+            train_payload["resume_from"] = resume_from
+            print(f"[train] Resuming pipeline from stage: {resume_from}")
+        
         job = self._request("POST", "/api/v1/ml/train", json=train_payload)
         self.model_id = job["model_id"]
         print(f"[train] job {job['job_id']} queued for model {self.model_id}")
@@ -478,7 +514,7 @@ def _maybe_plot_forecast(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and test Treasury ETF models via backend APIs")
-    parser.add_argument("--api-url", default=os.environ.get("SABLIER_API_URL", "http://localhost:8000"))
+    parser.add_argument("--api-url", default=os.environ.get("SABLIER_API_URL", "https://sablier-api-v2-215397666394.us-central1.run.app"))
     parser.add_argument("--stage", choices=["all", "training", "forecast"], default="all")
     parser.add_argument("--project-id", help="Existing project to reuse (will be reused if found by name)")
     parser.add_argument("--model-id", help="Existing model to reuse (will be reused if found by name)")
@@ -492,8 +528,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--fred-api-key", default=os.environ.get("FRED_API_KEY", "3d349d18e62cab7c2d55f1a6680f06d8"))
     parser.add_argument("--project-name", default="Treasury ETFs (Backend API)")
     parser.add_argument("--project-description", default="Treasury ETF template built via backend endpoints")
-    parser.add_argument("--training-start", default="2020-01-01")
-    parser.add_argument("--training-end", default="2024-12-31")
+    parser.add_argument("--training-start", default="2000-01-01")
+    parser.add_argument("--training-end", default="2025-09-01")
     parser.add_argument("--model-name", default="Treasury ETF Forecasting Model (API)")
     parser.add_argument(
         "--model-description",
@@ -503,11 +539,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--scenario-date", default="2020-03-15")
     parser.add_argument("--past-window", type=int, default=100)
     parser.add_argument("--future-window", type=int, default=80)
-    parser.add_argument("--stride", type=int, default=5)
+    parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--training-split", type=float, default=0.8, help="Fraction allocated to training split")
     parser.add_argument("--n-regimes", type=int, default=3)
-    parser.add_argument("--training-timeout", type=int, default=3600, help="Seconds to wait for training completion")
+    parser.add_argument("--training-timeout", type=int, default=7200, help="Seconds to wait for training completion")
     parser.add_argument("--poll-interval", type=int, default=60, help="Polling cadence for training status")
+    parser.add_argument(
+        "--resume-from",
+        choices=["sample_generation", "fitting", "encoding", "training"],
+        default=None,
+        help="Resume training pipeline from a specific stage (skips earlier stages if data exists). "
+             "'sample_generation' = regenerate samples, 'fitting' = refit encoders, "
+             "'encoding' = re-encode samples, 'training' = only retrain copula"
+    )
     parser.add_argument("--forecast-paths", type=int, default=10, help="Number of forecast trajectories")
     return parser.parse_args(argv)
 
@@ -556,6 +600,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 n_regimes=args.n_regimes,
                 poll_interval=args.poll_interval,
                 timeout=args.training_timeout,
+                resume_from=args.resume_from,
             )
 
         if args.stage in {"all", "forecast"}:
