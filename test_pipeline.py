@@ -49,16 +49,11 @@ DEFAULT_CONDITIONING_FEATURES: List[Dict[str, str]] = [
     {"id": "^IRX", "source": "yahoo", "name": "13-Week Treasury Yield"},
     {"id": "^FVX", "source": "yahoo", "name": "5-Year Treasury Yield"},
     {"id": "^TNX", "source": "yahoo", "name": "10-Year Treasury Yield"},
-    {"id": "^TYX", "source": "yahoo", "name": "30-Year Treasury Yield"},
     {"id": "T10Y2Y", "source": "fred", "name": "10-Year Minus 2-Year Treasury Spread"},
     {"id": "T10YIE", "source": "fred", "name": "10-Year Breakeven Inflation Rate"},
-    {"id": "DFII10", "source": "fred", "name": "10-Year TIPS Yield"},
-    {"id": "CPILFESL", "source": "fred", "name": "Core CPI"},
-    {"id": "FEDFUNDS", "source": "fred", "name": "Federal Funds Rate"},
     {"id": "BAMLC0A0CM", "source": "fred", "name": "Investment Grade Corporate Spread"},
     {"id": "VIXCLS", "source": "fred", "name": "VIX Volatility Index"},
     {"id": "UNRATE", "source": "fred", "name": "Unemployment Rate"},
-    {"id": "DTWEXBGS", "source": "fred", "name": "Trade Weighted Dollar Index"},
 ]
 
 DEFAULT_TARGET_FEATURES: List[Dict[str, str]] = [
@@ -113,7 +108,8 @@ class TreasuryWorkflow:
         self.scenario_name = scenario_name
         self.model_name = model_name
         self.model_description = model_description
-        timeout = httpx.Timeout(180.0, connect=30.0, read=180.0, write=180.0)
+        # No timeout - wait as long as needed
+        timeout = httpx.Timeout(None, connect=30.0)
         self.session = httpx.Client(
             base_url=self.api_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -231,9 +227,12 @@ class TreasuryWorkflow:
             resume_from: Optional stage to resume from ('sample_generation', 'fitting', 'encoding', 'training')
                         None = full pipeline (default)
                         'sample_generation' = regenerate normalized samples
-                        'fitting' = refit encoding models (wavelet + PCA)
+                        'fitting' = refit encoding models (wavelet + ICA→PCA)
                         'encoding' = re-encode samples with existing models
                         'training' = only retrain copula (fastest)
+        
+        Note: ICA (temporal decorrelation) is always applied.
+              PCA (feature compression) is automatically applied only to multivariate groups.
         """
         if not self.project:
             raise RuntimeError("Project must be created or specified before training")
@@ -295,7 +294,8 @@ class TreasuryWorkflow:
 
         elapsed = 0
         status = "queued"
-        while elapsed <= timeout_seconds:
+        # If timeout is None or <= 0, poll indefinitely
+        while timeout_seconds is None or timeout_seconds <= 0 or elapsed <= timeout_seconds:
             resp = self._request(
                 "GET",
                 f"/api/v1/ml/train/{self.model_id}/status",
@@ -459,6 +459,28 @@ def _maybe_plot_forecast(
     if not use_dates:
         ax.axvline(x=len(past_series), color="red", linestyle=":", linewidth=2, alpha=0.5, label="Forecast Start", zorder=4)
 
+    # Plot historical target future path (from simulation date) if available
+    historical_future_path = None
+    for entry in historical:
+        if (entry.get("feature") == target_feature and 
+            entry.get("temporal_tag") == "future" and 
+            entry.get("_is_historical_pattern") == True):
+            values = entry.get("reconstructed_values") or []
+            if values:
+                historical_future_path = list(values)
+                break
+    
+    if historical_future_path:
+        # Get simulation date for label
+        conditioning_summary = forecast_data.get("conditioning_summary", {})
+        simulation_date = conditioning_summary.get("default_future_simulation_date")
+        hist_label = f"Historical Path ({simulation_date})" if simulation_date else "Historical Path"
+        
+        # Plot with SDK style: green, o-, linewidth=2.5, markersize=5, alpha=0.9, zorder=6
+        ax.plot(future_t[:len(historical_future_path)], historical_future_path, "o-", 
+               color="green", linewidth=2.5, markersize=5, alpha=0.9, 
+               label=hist_label, zorder=6)
+
     n_to_plot = min(50, n_samples)
     for i in range(n_to_plot):
         ax.plot(future_t, forecasts_array[i], "-", alpha=0.2, linewidth=0.8, color="steelblue", zorder=2)
@@ -526,9 +548,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Admin API key (default reads backend/admin/admin_api_key_v2.txt)",
     )
     parser.add_argument("--fred-api-key", default=os.environ.get("FRED_API_KEY", "3d349d18e62cab7c2d55f1a6680f06d8"))
-    parser.add_argument("--project-name", default="Treasury ETFs (Backend API)")
-    parser.add_argument("--project-description", default="Treasury ETF template built via backend endpoints")
-    parser.add_argument("--training-start", default="2000-01-01")
+    parser.add_argument("--project-name", default="main project")
+    parser.add_argument("--project-description", default="Main project containing all available feature sets and models")
+    parser.add_argument("--training-start", default="2010-01-01")
     parser.add_argument("--training-end", default="2025-09-01")
     parser.add_argument("--model-name", default="Treasury ETF Forecasting Model (API)")
     parser.add_argument(
@@ -542,7 +564,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--training-split", type=float, default=0.8, help="Fraction allocated to training split")
     parser.add_argument("--n-regimes", type=int, default=3)
-    parser.add_argument("--training-timeout", type=int, default=7200, help="Seconds to wait for training completion")
+    parser.add_argument("--training-timeout", type=int, default=0, help="Seconds to wait for training completion (0 = no timeout)")
     parser.add_argument("--poll-interval", type=int, default=60, help="Polling cadence for training status")
     parser.add_argument(
         "--resume-from",
@@ -553,6 +575,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              "'encoding' = re-encode samples, 'training' = only retrain copula"
     )
     parser.add_argument("--forecast-paths", type=int, default=10, help="Number of forecast trajectories")
+    parser.add_argument(
+        "--wavelet-past",
+        default="db2",
+        help="Wavelet family for past windows (default: db2)"
+    )
+    parser.add_argument(
+        "--wavelet-future",
+        default="db4",
+        help="Wavelet family for future windows (default: db4)"
+    )
     return parser.parse_args(argv)
 
 
@@ -570,6 +602,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         "futureWindow": args.future_window,
         "stride": args.stride,
         "splitPercentages": {"training": training_split, "validation": validation_split},
+        "waveletFamilyConfig": {
+            "past": args.wavelet_past,
+            "future": args.wavelet_future
+        }
     }
 
     workflow = TreasuryWorkflow(

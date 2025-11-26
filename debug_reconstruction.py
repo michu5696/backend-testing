@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Debug script to visualize wavelet + PCA reconstruction quality.
+Debug script to visualize reconstruction quality using ReconstructionEngine.
 
 This script:
 1. Fetches a sample from the trained model
-2. Takes a specific feature/window
-3. Reconstructs it through the full pipeline (wavelet -> PCA -> inverse PCA -> inverse wavelet)
-4. Plots original vs reconstructed to diagnose quality issues
+2. Uses ReconstructionEngine (same as production forecasting) to reconstruct
+3. Compares original vs reconstructed to diagnose quality issues
+4. Plots results for visual inspection
+
+NEW ARCHITECTURE (Regime-Aware PCA/ICA):
+- Encoding: Normalize → PCA/ICA per (feature_group, window_type, regime_id) → Store (with optional regime indicator)
+- Decoding: Load → Extract regime indicator (if n_regimes > 1) → PCA/ICA inverse → Denormalize
 """
 
 import asyncio
@@ -17,7 +21,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime
+from typing import Dict, List, Any, Tuple
 
 # Add backend to path
 backend_path = Path(__file__).parent.parent / "backend"
@@ -32,24 +36,38 @@ if env_path.exists():
 else:
     print(f"⚠️  No .env file found at {env_path}")
 
-from src.cloudsql_client import CloudSQLManager, CloudStorageManager
-from src.wavelet_encoder import WaveletEncoder
-from src.pca_ica_encoder import PCAICAEncoder
+from cloudsql_client import CloudSQLManager
+from services.pipeline.reconstruct import ReconstructionEngine
 
 
-async def load_sample_and_encoders(model_id: str, sample_index: int = 0):
-    """Load a sample and its encoding models."""
+async def load_latest_model():
+    """Find and return the latest trained model."""
     db = CloudSQLManager()
-    gcs = CloudStorageManager()
     
-    # Get model info
-    model = await db.get_model(model_id)
-    if not model:
-        raise ValueError(f"Model {model_id} not found")
-    
-    user_id = model['user_id']
-    print(f"📦 Model: {model['name']}")
-    print(f"   Owner: {user_id}")
+    print("🔍 Finding latest trained model...")
+    async with db.connection() as conn:
+        result = await conn.fetchrow("""
+            SELECT id, name, user_id, created_at 
+            FROM models 
+            WHERE vine_copula_path IS NOT NULL
+            ORDER BY created_at DESC 
+            LIMIT 1
+        """)
+        if not result:
+            raise ValueError("No trained models found")
+        
+        model_id = str(result['id'])
+        user_id = str(result['user_id'])
+        print(f"✅ Found latest model: {result['name']} (created: {result['created_at']})")
+        print(f"   Model ID: {model_id}")
+        print(f"   User ID: {user_id}")
+        
+        return model_id, user_id
+
+
+async def load_sample(model_id: str, user_id: str, sample_index: int = 0):
+    """Load a normalized and encoded sample."""
+    db = CloudSQLManager()
     
     # Get normalized samples
     samples_normalized = await db.get_samples_normalized(user_id, model_id, split_type='training')
@@ -76,571 +94,651 @@ async def load_sample_and_encoders(model_id: str, sample_index: int = 0):
     print(f"   Sample ID: {sample_norm.get('id') or sample_norm.get('sample_id', 'N/A')}")
     print(f"   Start date: {sample_norm.get('start_date')}")
     
-    # Load wavelet config from model metadata
-    model_metadata = json.loads(model.get('metadata', '{}')) if isinstance(model.get('metadata'), str) else model.get('metadata', {})
-    wavelet_config = model_metadata.get('wavelet_config', {})
-    
-    if not wavelet_config:
-        raise ValueError("No wavelet config found in model metadata")
-    
-    print(f"\n🌊 Wavelet encoders available: {len(wavelet_config)} features")
-    
-    # Load PCA/ICA models metadata from database
-    encoding_models = await db.load_encoding_models_metadata(model_id)
-    print(f"📦 PCA/ICA models available: {len(encoding_models)}")
-    
-    pca_models = {}
-    for model_key, model_metadata_entry in encoding_models.items():
-        gcs_path = model_metadata_entry.get('storage_path')
-        if gcs_path:
-            try:
-                encoder = await gcs.download_encoder(gcs_path)
-                pca_models[model_key] = encoder
-                print(f"   ✓ Loaded {model_key}")
-            except Exception as e:
-                print(f"   ✗ Failed to load {model_key}: {e}")
-    
-    # Load feature groups
-    conditioning_set_id = model.get('conditioning_set_id')
-    target_set_id = model.get('target_set_id')
-    
-    feature_groups = {}
-    if conditioning_set_id:
-        cond_set = await db.get_feature_set(conditioning_set_id)
-        if cond_set:
-            cond_groups = json.loads(cond_set.get('feature_groups', '{}')) if isinstance(cond_set.get('feature_groups'), str) else cond_set.get('feature_groups', {})
-            feature_groups['conditioning_groups'] = cond_groups.get('groups', [])
-    
-    if target_set_id:
-        target_set = await db.get_feature_set(target_set_id)
-        if target_set:
-            target_groups = json.loads(target_set.get('feature_groups', '{}')) if isinstance(target_set.get('feature_groups'), str) else target_set.get('feature_groups', {})
-            feature_groups['target_groups'] = target_groups.get('groups', [])
-    
-    print(f"\n📦 Feature groups:")
-    print(f"   Conditioning: {len(feature_groups.get('conditioning_groups', []))} groups")
-    print(f"   Target: {len(feature_groups.get('target_groups', []))} groups")
-    
-    return {
-        'model': model,
-        'sample_norm': sample_norm,
-        'sample_enc': sample_enc,
-        'wavelet_config': wavelet_config,
-        'pca_models': pca_models,
-        'feature_groups': feature_groups,
-    }
+    return sample_norm, sample_enc
 
 
-def reconstruct_window(
+def extract_feature_info(sample_enc: Dict) -> List[Dict[str, Any]]:
+    """Extract feature_info from encoded sample metadata."""
+    component_metadata = sample_enc.get('component_metadata', {})
+    if isinstance(component_metadata, str):
+        component_metadata = json.loads(component_metadata)
+    
+    feature_info_list = component_metadata.get('feature_info', [])
+    print(f"\n📋 Found {len(feature_info_list)} feature/window combinations in encoded sample")
+    
+    return feature_info_list
+
+
+async def reconstruct_window_with_engine(
+    engine: ReconstructionEngine,
+    sample_norm: Dict,
+    sample_enc: Dict,
     feature_name: str,
     window_type: str,  # 'past', 'future_conditioning_series', 'future_target_residuals'
-    normalized_data: np.ndarray,
-    encoded_data: np.ndarray,
-    wavelet_config: dict,
-    pca_models: dict,
-    feature_groups: dict,
-    metadata: dict,
-):
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Reconstruct a window through the full pipeline.
+    Reconstruct a window using ReconstructionEngine.
     
     Returns:
-        tuple: (original_normalized, reconstructed_from_encoded)
+        tuple: (original_denormalized, reconstructed_denormalized)
     """
-    # Determine data keys
+    # Map window_type to data keys and determine actual window_type for model lookup
     if window_type == 'past':
-        data_key = 'normalized_past'
+        normalized_key = 'normalized_past'
         encoded_key = 'encoded_past_series'
         order_key = 'feature_order_past'
         temporal_tag = 'past'
+        data_type = 'encoded_normalized_series'
+        # feature_info uses simplified data_type names
+        feature_info_data_type = 'series'
+        model_window_type = 'past'  # For model key lookup
     elif window_type == 'future_conditioning_series':
-        data_key = 'normalized_future_conditioning_series'
+        normalized_key = 'normalized_future_conditioning_series'
         encoded_key = 'encoded_future_conditioning_series'
         order_key = 'feature_order_future_conditioning_series'
         temporal_tag = 'future'
+        data_type = 'encoded_normalized_series'
+        feature_info_data_type = 'series'
+        model_window_type = 'future'  # For model key lookup
     elif window_type == 'future_target_residuals':
-        data_key = 'normalized_future_target_residuals'
+        normalized_key = 'normalized_future_target_residuals'
         encoded_key = 'encoded_future_target_residuals'
         order_key = 'feature_order_target'
         temporal_tag = 'future'
+        data_type = 'encoded_normalized_residuals'
+        feature_info_data_type = 'target_residuals'
+        model_window_type = 'target_residuals'  # For model key lookup
     else:
         raise ValueError(f"Unknown window_type: {window_type}")
     
-    # Get feature order
-    feature_order = metadata.get(order_key, [])
-    if feature_name not in feature_order:
-        raise ValueError(f"Feature {feature_name} not found in {order_key}")
+    print(f"\n🔍 Reconstructing {feature_name} ({window_type}):")
     
-    feature_idx = feature_order.index(feature_name)
+    # Get metadata
+    metadata_norm = json.loads(sample_norm.get('metadata', '{}')) if isinstance(sample_norm.get('metadata'), str) else sample_norm.get('metadata', {})
+    component_metadata = sample_enc.get('component_metadata', {})
+    if isinstance(component_metadata, str):
+        component_metadata = json.loads(component_metadata)
+    
+    # Get feature order (contains actual feature names, not group IDs)
+    feature_order = metadata_norm.get(order_key, [])
+    
+    # Check if feature_name is a group ID or an actual feature name
+    # Group IDs can be like "conditioning_group_Feature1_Feature2" or just the group name
+    actual_features = None  # Will hold the list of feature names for groups
+    group_id = None
+    
+    # Try to find the group in feature_groups
+    if engine.feature_groups:
+        for group in engine.feature_groups.get('conditioning_groups', []) + engine.feature_groups.get('target_groups', []):
+            group_name = group.get('name')  # Use 'name' not 'id'
+            if group_name == feature_name:
+                group_id = group_name
+                actual_features = group.get('features', [])
+                break
+    
+    # If not found as group, check if it's a feature that belongs to a group
+    if not actual_features and feature_name in engine.feature_to_group_map:
+        group_id = engine.feature_to_group_map[feature_name]
+        actual_features = engine._get_group_features(group_id)
+    
+    # If still not found, try to find encoding model with 3-tuple keys
+    if not actual_features:
+        # Try to find any model key matching this feature/group
+        # Model keys are 3-tuples: (group_id, window_type, regime_id)
+        # Use model_window_type (not window_type) for lookup
+        matching_keys = [
+            key for key in engine.encoding_models.keys()
+            if isinstance(key, tuple) and len(key) == 3
+            and key[0] == feature_name and key[1] == model_window_type
+        ]
+        
+        if matching_keys:
+            # Found a model - get features from the model metadata
+            first_key = matching_keys[0]
+            model_metadata = engine.encoding_models[first_key]
+            actual_features = model_metadata.get('features', [])
+            group_id = feature_name
+            print(f"   ✓ Found encoding model for {feature_name}, extracted features: {actual_features}")
+        
+        if not actual_features:
+            # Skip if this is a future_conditioning_series window and the group is not in the conditioning set
+            if window_type == 'future_conditioning_series':
+                print(f"   ⚠️  Skipping: Group/feature {feature_name} not in conditioning set for future windows")
+                return None, None
+            raise ValueError(f"Could not find encoding model or group for {feature_name} with temporal {temporal_tag}")
+        
+        # Use the first feature from the group to get normalized data
+        # (we'll reconstruct the whole group, but we need one feature for comparison)
+        if actual_features[0] not in feature_order:
+            # Skip if this is a target_residuals window and the feature is not in the target set
+            if window_type == 'future_target_residuals':
+                print(f"   ⚠️  Skipping: Feature {actual_features[0]} (from group {group_id}) not in target set")
+                return None, None
+            raise ValueError(f"Feature {actual_features[0]} (from group {group_id}) not found in {order_key}")
+        
+        feature_idx = feature_order.index(actual_features[0])
+        print(f"   Group {group_id} contains features: {actual_features}")
+        print(f"   Using first feature '{actual_features[0]}' for comparison")
+    else:
+        # This is an actual feature name
+        if feature_name not in feature_order:
+            # Skip if this is a target_residuals window and the feature is not in the target set
+            if window_type == 'future_target_residuals':
+                print(f"   ⚠️  Skipping: Feature {feature_name} not in target set")
+                return None, None
+            # Skip if this is a future_conditioning_series window and the feature is not in the conditioning set
+            if window_type == 'future_conditioning_series':
+                print(f"   ⚠️  Skipping: Feature {feature_name} not in conditioning set for future windows")
+                return None, None
+            raise ValueError(f"Feature {feature_name} not found in {order_key}")
+        
+        feature_idx = feature_order.index(feature_name)
     
     # Get original normalized data
-    original = normalized_data[feature_idx]
+    normalized_data = sample_norm.get(normalized_key, [])
+    if feature_idx >= len(normalized_data):
+        raise ValueError(f"Feature index {feature_idx} out of range for {normalized_key}")
     
-    print(f"\n🔍 Reconstructing {feature_name} ({window_type}):")
-    print(f"   Original shape: {original.shape}")
-    print(f"   Original range: [{np.min(original):.4f}, {np.max(original):.4f}]")
+    original_normalized = np.array(normalized_data[feature_idx], dtype=float)
+    print(f"   Original normalized shape: {original_normalized.shape}")
+    print(f"   Original normalized range: [{np.min(original_normalized):.4f}, {np.max(original_normalized):.4f}]")
     
-    # Get the encoded data slice for this specific feature/group from metadata
-    # The encoded_data passed in is the ENTIRE window array, we need to slice it
-    component_metadata = metadata.get('component_metadata', {})
+    # Get encoded data and slice for this feature
+    encoded_full = sample_enc.get(encoded_key, [])
+    
+    # Convert to numpy array if it's a list
+    if isinstance(encoded_full, list):
+        encoded_full = np.array(encoded_full, dtype=float)
+    elif not isinstance(encoded_full, np.ndarray):
+        encoded_full = np.array(encoded_full, dtype=float)
+    
+    print(f"   Encoded full array length: {len(encoded_full)}")
+    
     feature_info_list = component_metadata.get('feature_info', [])
     
-    # Find this feature's range in the encoded data
-    feature_encoded_range = None
+    # Find the range for this feature or group
+    feature_range = None
+    matched_group_features = []
+    
     for info in feature_info_list:
-        info_feature = info.get('feature', '')
+        info_feature = info.get('feature', '')  # This is the group ID or feature name
         info_temporal = info.get('temporal_tag', '')
         info_data_type = info.get('data_type', '')
+        group_features = info.get('group_features', [])
         
-        # Match by feature name and window type
-        matches_feature = (info_feature == feature_name or 
-                          (info_feature.startswith('group_') and feature_name in info.get('group_features', [])))
-        matches_temporal = (temporal_tag in info_temporal)
-        matches_data_type = ('residuals' in window_type) == ('residuals' in info_data_type or 'residuals' in info_temporal)
+        # Match by temporal tag and data type (using simplified data_type from feature_info)
+        temporal_match = (info_temporal == temporal_tag)
+        data_type_match = (info_data_type == feature_info_data_type)
         
-        if matches_feature and matches_temporal and matches_data_type:
-            feature_encoded_range = info.get('range', [])
-            print(f"   Found metadata range: {feature_encoded_range}")
-            break
+        if temporal_match and data_type_match:
+            # Check if this matches our feature_name or group_id
+            # Case 1: feature_name is a group ID (exact match with info_feature)
+            # Case 2: feature_name is an actual feature (exact match with info_feature)
+            # Case 3: group_id exists and matches info_feature
+            # Note: group_features is empty in the metadata, so we match by info_feature
+            feature_match = (info_feature == feature_name) or (group_id and info_feature == group_id)
+            
+            if feature_match:
+                feature_range = info.get('range', [])
+                matched_group_features = group_features if group_features else [info_feature]
+                print(f"   ✓ Found encoded range: {feature_range}")
+                print(f"     Feature/Group ID: {info_feature}")
+                print(f"     Temporal: {info_temporal}, Data type: {info_data_type}")
+                break
     
-    # Slice the encoded data to get just this feature/group's portion
-    if feature_encoded_range and len(feature_encoded_range) == 2:
-        start, end = feature_encoded_range
-        encoded_data_slice = encoded_data[start:end]
-        print(f"   Sliced encoded data from [{start}:{end}], length: {len(encoded_data_slice)}")
+    if feature_range is None or len(feature_range) != 2:
+        raise ValueError(f"Could not find encoded range for {feature_name} in {window_type}")
+    
+    start, end = feature_range
+    
+    # IMPORTANT: The feature_info ranges are relative to the CONCATENATED training matrix:
+    # [past_all, future_cond, target_residuals]
+    # But we're slicing from individual arrays. We need to adjust the range based on which section
+    # this feature belongs to.
+    
+    # Calculate offset based on which section this is in the training matrix
+    # 1. Calculate the length of the past section
+    encoded_past = sample_enc.get('encoded_past_series', [])
+    if isinstance(encoded_past, list):
+        encoded_past = np.array(encoded_past, dtype=float)
+    past_len = len(encoded_past)
+    
+    # 2. Calculate the length of the future conditioning section
+    encoded_future_cond = sample_enc.get('encoded_future_conditioning_series', [])
+    if isinstance(encoded_future_cond, list):
+        encoded_future_cond = np.array(encoded_future_cond, dtype=float)
+    future_cond_len = len(encoded_future_cond)
+    
+    # 3. Determine which section this feature belongs to and adjust the range
+    if window_type == 'past':
+        # Past section: ranges start from 0, no offset needed
+        adjusted_start = start
+        adjusted_end = end
+        section_name = "past"
+    elif window_type == 'future_conditioning_series':
+        # Future conditioning section: ranges start after past section
+        adjusted_start = start - past_len
+        adjusted_end = end - past_len
+        section_name = "future_conditioning"
+    elif window_type == 'future_target_residuals':
+        # Target residuals section: ranges start after past + future_cond sections
+        adjusted_start = start - past_len - future_cond_len
+        adjusted_end = end - past_len - future_cond_len
+        section_name = "target_residuals"
     else:
-        print(f"   ⚠️  No metadata range found, using full encoded data (length: {len(encoded_data)})")
-        encoded_data_slice = encoded_data
+        adjusted_start = start
+        adjusted_end = end
+        section_name = "unknown"
     
-    # Step 1: Get wavelet encoder
-    wavelet_key = f"{feature_name}_{temporal_tag}"
-    if temporal_tag == 'future' and 'residuals' in window_type:
-        wavelet_key += "_residuals"
+    print(f"   Training matrix range: [{start}:{end}]")
+    print(f"   Section: {section_name}, adjusted range: [{adjusted_start}:{adjusted_end}]")
+    print(f"   Array length: {len(encoded_full)}")
     
-    if feature_name not in wavelet_config:
-        raise ValueError(f"No wavelet config for {feature_name}")
-    
-    window_label = temporal_tag if 'residuals' not in window_type else f"{temporal_tag}_residuals"
-    feature_wavelet_config = wavelet_config[feature_name].get(window_label)
-    if not feature_wavelet_config:
-        raise ValueError(f"No wavelet config for {feature_name}.{window_label}")
-    
-    wavelet_encoder = WaveletEncoder.from_config(feature_wavelet_config)
-    print(f"   Wavelet: {wavelet_encoder.wavelet_family}, level={wavelet_encoder.fitted_level}, n_coeffs={wavelet_encoder.n_coefficients}")
-    
-    # Step 2: Apply wavelet transform to original
-    wavelet_coeffs_original = wavelet_encoder.encode(original)
-    print(f"   Wavelet coeffs from original: {wavelet_coeffs_original.shape}")
-    print(f"   Wavelet coeffs range: [{np.min(wavelet_coeffs_original):.4f}, {np.max(wavelet_coeffs_original):.4f}]")
-    
-    # Step 3: Check if feature is in a multivariate group (needs PCA)
-    is_multivariate = False
-    group_id = None
-    pca_model = None
-    
-    # Check conditioning groups
-    for group in feature_groups.get('conditioning_groups', []):
-        if feature_name in group.get('features', []):
-            is_multivariate = group.get('is_multivariate', len(group.get('features', [])) > 1)
-            group_id = group.get('id') or group.get('name')
-            break
-    
-    # Check target groups
-    if not is_multivariate:
-        for group in feature_groups.get('target_groups', []):
-            if feature_name in group.get('features', []):
-                is_multivariate = group.get('is_multivariate', len(group.get('features', [])) > 1)
-                group_id = group.get('id') or group.get('name')
-                break
-    
-    if is_multivariate and group_id:
-        # Look for PCA model
-        # group_id already has "group_" prefix for PCA-based groups
-        if not group_id.startswith('group_'):
-            pca_key = f"group_{group_id}_{temporal_tag}"
+    # Validate adjusted range
+    if adjusted_start < 0 or adjusted_end > len(encoded_full):
+        print(f"   ⚠️  WARNING: Adjusted range [{adjusted_start}:{adjusted_end}] is out of bounds for array of length {len(encoded_full)}")
+        print(f"      This suggests a mismatch between feature_info ranges and actual array structure")
+        # Try to use the original range if it fits
+        if 0 <= start < len(encoded_full) and 0 <= end <= len(encoded_full):
+            print(f"      Falling back to original range [{start}:{end}]")
+            adjusted_start = start
+            adjusted_end = end
         else:
-            pca_key = f"{group_id}_{temporal_tag}"
-        if 'residuals' in window_type:
-            pca_key += "_residuals"
-        
-        pca_model = pca_models.get(pca_key)
-        if pca_model:
-            print(f"   PCA model: {pca_key}")
-            print(f"   PCA components: {pca_model.n_components_}")
-        else:
-            print(f"   ⚠️  No PCA model found for {pca_key} (expected for multivariate group)")
-            is_multivariate = False
+            raise ValueError(f"Adjusted range [{adjusted_start}:{adjusted_end}] is out of bounds for {section_name} array (length={len(encoded_full)})")
     
-    # Step 4: Reconstruct from encoded data
-    if is_multivariate and pca_model:
-        # Multivariate: PCA inverse + Wavelet inverse
-        print(f"   🔄 Multivariate reconstruction (PCA + Wavelet)")
+    encoded_slice = encoded_full[adjusted_start:adjusted_end]
+    print(f"   Encoded data slice: [{adjusted_start}:{adjusted_end}], length={len(encoded_slice)}")
+    
+    # Check if we need to handle regime indicator
+    # If n_regimes > 1, the last coefficient is the regime indicator
+    # We need to check how many regimes exist for this (group, window) combination
+    n_regimes = 0
+    lookup_group_id = group_id if group_id else feature_name
+    if lookup_group_id:
+        # Find available regime IDs for this (group, window)
+        # Use model_window_type for lookup
+        available_regimes = [
+            key[2] for key in engine.encoding_models.keys() 
+            if isinstance(key, tuple) and len(key) == 3 
+            and key[0] == lookup_group_id and key[1] == model_window_type
+        ]
+        n_regimes = len(available_regimes)
+    
+    # If n_regimes > 1, the encoded_slice includes a regime indicator as the last element
+    # But we should NOT strip it here - let ReconstructionEngine handle it
+    # The feature_info range already accounts for the regime indicator if present
+    
+    print(f"   Regimes available: {n_regimes} (regime indicator handling done by ReconstructionEngine)")
+    
+    # Build window dict for ReconstructionEngine
+    # Must include feature, temporal_tag, data_type, and the encoded data
+    window_dict = {
+        "feature": group_id if group_id else feature_name,  # Use group_id if found, otherwise feature_name
+        "temporal_tag": temporal_tag,
+        data_type: encoded_slice.tolist() if isinstance(encoded_slice, np.ndarray) else encoded_slice  # Convert to list if numpy array
+    }
+    
+    # Extract reference values for target_residuals reconstruction
+    # IMPORTANT: Reference values must be NORMALIZED (not denormalized) because:
+    # - The decoded residuals are normalized
+    # - We add normalized reference to normalized residuals to get normalized series
+    # - Then we denormalize the series
+    reference_values = {}
+    if window_type == 'future_target_residuals':
+        # Get past normalized data
+        past_normalized = sample_norm.get('normalized_past', [])
+        past_feature_order = metadata_norm.get('feature_order_past', [])
         
-        # The encoded data is stored as a flat array of PCA components
-        # We need to:
-        # 1. Extract the PCA components for this group/window
-        # 2. Apply PCA inverse to get wavelet coefficients for all features in the group
-        # 3. Extract this specific feature's wavelet coefficients
-        # 4. Apply wavelet inverse to get the time series
+        # Get the features we're reconstructing
+        features_to_reconstruct = actual_features if actual_features else [feature_name]
         
-        # Get the group's features
-        group_features = []
-        for group in feature_groups.get('conditioning_groups', []) + feature_groups.get('target_groups', []):
-            group_id_check = group.get('id') or group.get('name')
-            if group_id_check == group_id:
-                group_features = group.get('features', [])
-                break
+        for feat in features_to_reconstruct:
+            if feat in past_feature_order:
+                feat_idx = past_feature_order.index(feat)
+                if feat_idx < len(past_normalized):
+                    past_series = np.array(past_normalized[feat_idx], dtype=float)
+                    if len(past_series) > 0:
+                        # Get the last value - it's already normalized!
+                        last_normalized = past_series[-1]
+                        reference_values[feat] = float(last_normalized)
+                        print(f"   Reference value (normalized) for {feat}: {last_normalized:.4f}")
+            else:
+                print(f"   ⚠️  No past data found for {feat}, cannot get reference value")
         
-        if not group_features:
-            print(f"   ⚠️  Could not find group features for {group_id}")
-            reconstructed = wavelet_encoder.decode(wavelet_coeffs_original)
-        else:
-            print(f"   Group features: {group_features}")
+        # Also add reference value keyed by group_id if it exists (for group-based reconstruction)
+        if group_id and features_to_reconstruct:
+            # Use the first feature's reference value for the group
+            first_feat = features_to_reconstruct[0]
+            if first_feat in reference_values:
+                reference_values[group_id] = reference_values[first_feat]
+                print(f"   Reference value (normalized) for group {group_id}: {reference_values[first_feat]:.4f}")
+    
+    # Call ReconstructionEngine._reconstruct_single_window()
+    # This handles: Extract regime indicator (if n_regimes > 1) → PCA/ICA inverse → Denormalize
+    # For target_residuals, reference_values are needed to convert residuals to series
+    reconstructed_list = await engine._reconstruct_single_window(window_dict, reference_values)
+    
+    if reconstructed_list is None or len(reconstructed_list) == 0:
+        raise ValueError("ReconstructionEngine returned empty result")
+    
+    # Return all reconstructed features (for multivariate groups) or single feature (for univariate)
+    # Build a list of (feature_name, original, reconstructed) tuples
+    results = []
+    
+    if group_id and actual_features:
+        # Multivariate group: return all features
+        print(f"   📊 Reconstructing {len(actual_features)} features from group {feature_name}")
+        
+        for feat_name in actual_features:
+            # Find reconstructed data for this feature
+            reconstructed_denormalized = None
+            for item in reconstructed_list:
+                if item.get('feature') == feat_name:
+                    reconstructed_denormalized = np.array(item.get('reconstructed_values', []), dtype=float)
+                    break
             
-            # The encoded data is a flat array
-            # For multivariate groups, the PCA components are stored per wavelet coefficient
-            # Structure: [pca_comp_0_for_coeff_0, pca_comp_1_for_coeff_0, ..., pca_comp_0_for_coeff_1, ...]
+            if reconstructed_denormalized is None:
+                print(f"   ⚠️  Skipping {feat_name}: not found in reconstructed results")
+                continue
             
-            n_features_in_group = len(group_features)
-            n_pca_components = pca_model.n_components_
-            n_wavelet_coeffs = wavelet_encoder.n_coefficients
+            # Get original normalized data for this feature
+            if feat_name not in feature_order:
+                print(f"   ⚠️  Skipping {feat_name}: not found in {order_key}")
+                continue
             
-            print(f"   Expected structure: {n_wavelet_coeffs} coeffs × {n_pca_components} PCA components = {n_wavelet_coeffs * n_pca_components} values")
-            print(f"   Encoded data slice length: {len(encoded_data_slice)}")
+            feat_idx = feature_order.index(feat_name)
+            if feat_idx >= len(normalized_data):
+                print(f"   ⚠️  Skipping {feat_name}: index {feat_idx} out of range")
+                continue
             
-            # Reshape encoded data: (n_coeffs, n_components)
-            try:
-                encoded_matrix = np.array(encoded_data_slice).reshape(n_wavelet_coeffs, n_pca_components)
-                print(f"   Reshaped encoded data: {encoded_matrix.shape}")
-                print(f"   Encoded data range: [{np.min(encoded_matrix):.4f}, {np.max(encoded_matrix):.4f}]")
+            feat_original_normalized = np.array(normalized_data[feat_idx], dtype=float)
+            
+            # For target_residuals, we need to convert residuals to series before denormalizing
+            # The normalized_data contains normalized residuals, we add normalized reference value
+            # to get normalized series, then denormalize
+            if window_type == 'future_target_residuals':
+                # Get reference value for this feature (already normalized)
+                ref_value_normalized = reference_values.get(feat_name)
+                if ref_value_normalized is None:
+                    print(f"   ⚠️  No reference value for {feat_name}, cannot convert residuals to series")
+                    continue
                 
-                # Apply PCA inverse per wavelet coefficient
-                # This gives us (n_coeffs, n_features)
-                decoded_wavelet_matrix = pca_model.decode(encoded_matrix)
-                print(f"   PCA decoded shape: {decoded_wavelet_matrix.shape}")
-                print(f"   PCA decoded range: [{np.min(decoded_wavelet_matrix):.4f}, {np.max(decoded_wavelet_matrix):.4f}]")
+                # Convert normalized residuals to normalized series: series = reference + residuals
+                # Both are already normalized, so just add them
+                feat_original_normalized_series = feat_original_normalized + ref_value_normalized
                 
-                # Extract this feature's wavelet coefficients
-                if feature_name not in group_features:
-                    print(f"   ⚠️  Feature {feature_name} not in group features!")
-                    reconstructed = wavelet_encoder.decode(wavelet_coeffs_original)
+                # Now denormalize the series
+                norm_params = engine.normalization_params.get(feat_name, {})
+                if norm_params:
+                    mean = norm_params.get('mean', 0)
+                    std = norm_params.get('std', 1)
+                    feat_original_denormalized = feat_original_normalized_series * std + mean
                 else:
-                    feature_idx_in_group = group_features.index(feature_name)
-                    wavelet_coeffs_from_pca = decoded_wavelet_matrix[:, feature_idx_in_group]
-                    
-                    print(f"   Feature index in group: {feature_idx_in_group}")
-                    print(f"   Wavelet coeffs from PCA: {wavelet_coeffs_from_pca.shape}")
-                    print(f"   Wavelet coeffs from PCA range: [{np.min(wavelet_coeffs_from_pca):.4f}, {np.max(wavelet_coeffs_from_pca):.4f}]")
-                    
-                    # Compare with original wavelet coeffs
-                    coeff_mse = np.mean((wavelet_coeffs_original - wavelet_coeffs_from_pca) ** 2)
-                    print(f"   📊 Wavelet coeff MSE (original vs PCA-decoded): {coeff_mse:.6f}")
-                    
-                    # Apply wavelet inverse
-                    reconstructed = wavelet_encoder.decode(wavelet_coeffs_from_pca)
-                    
-            except Exception as e:
-                print(f"   ⚠️  Error during PCA reconstruction: {e}")
-                print(f"   Falling back to wavelet-only reconstruction")
-                reconstructed = wavelet_encoder.decode(wavelet_coeffs_original)
+                    feat_original_denormalized = feat_original_normalized_series
+            else:
+                # For series (past, future_conditioning_series), denormalize directly
+                norm_params = engine.normalization_params.get(feat_name, {})
+                if norm_params:
+                    mean = norm_params.get('mean', 0)
+                    std = norm_params.get('std', 1)
+                    feat_original_denormalized = feat_original_normalized * std + mean
+                else:
+                    feat_original_denormalized = feat_original_normalized
+            
+            # Compute reconstruction error
+            mse = np.mean((feat_original_denormalized - reconstructed_denormalized) ** 2)
+            mae = np.mean(np.abs(feat_original_denormalized - reconstructed_denormalized))
+            max_error = np.max(np.abs(feat_original_denormalized - reconstructed_denormalized))
+            
+            # No wavelet-only reconstruction in new architecture (PCA/ICA directly on normalized data)
+            wavelet_only_denormalized = None
+            
+            print(f"   ✓ {feat_name}:")
+            print(f"      Reconstructed shape: {reconstructed_denormalized.shape}")
+            print(f"      Original range: [{np.min(feat_original_denormalized):.4f}, {np.max(feat_original_denormalized):.4f}]")
+            print(f"      Reconstructed range: [{np.min(reconstructed_denormalized):.4f}, {np.max(reconstructed_denormalized):.4f}]")
+            print(f"      MSE: {mse:.6f}, MAE: {mae:.6f}, Max Error: {max_error:.6f}")
+            
+            results.append((feat_name, feat_original_denormalized, reconstructed_denormalized, wavelet_only_denormalized))
     else:
-        # Univariate: just wavelet
-        print(f"   🔄 Univariate reconstruction (Wavelet only)")
-        reconstructed = wavelet_encoder.decode(wavelet_coeffs_original)
+        # Univariate feature: return single feature
+        lookup_feature = feature_name
+        reconstructed_denormalized = None
+        
+        for item in reconstructed_list:
+            if item.get('feature') == lookup_feature:
+                reconstructed_denormalized = np.array(item.get('reconstructed_values', []), dtype=float)
+                break
+        
+        if reconstructed_denormalized is None:
+            print(f"   ⚠️  Available reconstructed features: {[item.get('feature') for item in reconstructed_list]}")
+            raise ValueError(f"Could not find reconstructed data for {lookup_feature}")
+        
+        # For target_residuals, convert residuals to series before denormalizing
+        if window_type == 'future_target_residuals':
+            # Get reference value for this feature (already normalized)
+            ref_value_normalized = reference_values.get(feature_name)
+            if ref_value_normalized is None:
+                print(f"   ⚠️  No reference value for {feature_name}, cannot convert residuals to series")
+                raise ValueError(f"No reference value for {feature_name}")
+            
+            # Convert normalized residuals to normalized series: series = reference + residuals
+            original_normalized_series = original_normalized + ref_value_normalized
+            
+            # Now denormalize the series
+            norm_params = engine.normalization_params.get(feature_name, {})
+            if norm_params:
+                mean = norm_params.get('mean', 0)
+                std = norm_params.get('std', 1)
+                original_denormalized = original_normalized_series * std + mean
+            else:
+                original_denormalized = original_normalized_series
+        else:
+            # For series (past, future_conditioning_series), denormalize directly
+            norm_params = engine.normalization_params.get(feature_name, {})
+            if norm_params:
+                mean = norm_params.get('mean', 0)
+                std = norm_params.get('std', 1)
+                original_denormalized = original_normalized * std + mean
+            else:
+                print(f"   ⚠️  No normalization params found for {feature_name}, using normalized data")
+                original_denormalized = original_normalized
+        
+        # No wavelet-only reconstruction in new architecture (PCA/ICA directly on normalized data)
+        wavelet_only_denormalized = None
+        
+        # Compute error metrics
+        mse = np.mean((original_denormalized - reconstructed_denormalized) ** 2)
+        mae = np.mean(np.abs(original_denormalized - reconstructed_denormalized))
+        max_error = np.max(np.abs(original_denormalized - reconstructed_denormalized))
+        
+        print(f"   Reconstructed shape: {reconstructed_denormalized.shape}")
+        print(f"   Reconstructed range: [{np.min(reconstructed_denormalized):.4f}, {np.max(reconstructed_denormalized):.4f}]")
+        print(f"   Original denormalized range: [{np.min(original_denormalized):.4f}, {np.max(original_denormalized):.4f}]")
+        print(f"   📊 Reconstruction Error:")
+        print(f"      MSE: {mse:.6f}")
+        print(f"      MAE: {mae:.6f}")
+        print(f"      Max Error: {max_error:.6f}")
+        
+        results.append((feature_name, original_denormalized, reconstructed_denormalized, wavelet_only_denormalized))
     
-    print(f"   Reconstructed shape: {reconstructed.shape}")
-    print(f"   Reconstructed range: [{np.min(reconstructed):.4f}, {np.max(reconstructed):.4f}]")
-    
-    # Calculate reconstruction error
-    if len(reconstructed) == len(original):
-        mse = np.mean((original - reconstructed) ** 2)
-        mae = np.mean(np.abs(original - reconstructed))
-        print(f"   📊 MSE: {mse:.6f}, MAE: {mae:.6f}")
-    else:
-        print(f"   ⚠️  Length mismatch: original={len(original)}, reconstructed={len(reconstructed)}")
-    
-    # Also reconstruct using wavelet-only (for comparison)
-    reconstructed_wavelet_only = wavelet_encoder.decode(wavelet_coeffs_original)
-    
-    return original, reconstructed, reconstructed_wavelet_only, wavelet_coeffs_original
+    return results
 
 
-def plot_reconstruction(feature_name: str, window_type: str, original: np.ndarray, reconstructed: np.ndarray, 
-                        reconstructed_wavelet_only: np.ndarray, wavelet_coeffs: np.ndarray):
-    """Plot original vs reconstructed."""
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+def plot_reconstruction(
+    feature_name: str,
+    window_type: str,
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    output_dir: Path,
+    wavelet_only: np.ndarray = None,
+):
+    """Plot original vs reconstructed time series."""
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
     
-    # Plot 1: Time series comparison
+    # Plot 1: Original vs Reconstructed
     ax1 = axes[0]
-    time_steps = np.arange(len(original))
-    
-    ax1.plot(time_steps, original, 'b-', linewidth=2.5, label='Original (Normalized)', alpha=0.8)
-    ax1.plot(time_steps, reconstructed_wavelet_only, 'g--', linewidth=2, label='Wavelet-Only Reconstruction', alpha=0.7)
-    ax1.plot(time_steps, reconstructed, 'r--', linewidth=2, label='PCA+Wavelet Reconstruction', alpha=0.7)
-    
-    ax1.set_xlabel('Time Step', fontsize=12)
-    ax1.set_ylabel('Normalized Value', fontsize=12)
-    ax1.set_title(f'{feature_name} - {window_type}\nOriginal vs Reconstructed', fontsize=14, fontweight='bold')
-    ax1.legend(fontsize=10, loc='best')
+    ax1.plot(original, label='Original', linewidth=2, alpha=0.8)
+    ax1.plot(reconstructed, label='Reconstruction (PCA/ICA)', linewidth=2, alpha=0.8, linestyle='--')
+    # Note: No wavelet-only reconstruction in new architecture
+    ax1.set_title(f'{feature_name} ({window_type}): Original vs Reconstructed')
+    ax1.set_xlabel('Time Step')
+    ax1.set_ylabel('Value')
+    ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # Calculate and display metrics for both reconstructions
-    metrics_lines = []
-    
-    if len(reconstructed_wavelet_only) == len(original):
-        mse_wav = np.mean((original - reconstructed_wavelet_only) ** 2)
-        mae_wav = np.mean(np.abs(original - reconstructed_wavelet_only))
-        corr_wav = np.corrcoef(original, reconstructed_wavelet_only)[0, 1]
-        metrics_lines.append(f'Wavelet-Only:')
-        metrics_lines.append(f'  MSE: {mse_wav:.6f}')
-        metrics_lines.append(f'  MAE: {mae_wav:.6f}')
-        metrics_lines.append(f'  Corr: {corr_wav:.4f}')
-    
-    if len(reconstructed) == len(original):
-        mse_pca = np.mean((original - reconstructed) ** 2)
-        mae_pca = np.mean(np.abs(original - reconstructed))
-        corr_pca = np.corrcoef(original, reconstructed)[0, 1]
-        metrics_lines.append(f'PCA+Wavelet:')
-        metrics_lines.append(f'  MSE: {mse_pca:.6f}')
-        metrics_lines.append(f'  MAE: {mae_pca:.6f}')
-        metrics_lines.append(f'  Corr: {corr_pca:.4f}')
-    
-    if metrics_lines:
-        metrics_text = '\n'.join(metrics_lines)
-        ax1.text(0.02, 0.98, metrics_text, transform=ax1.transAxes, 
-                fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5), family='monospace')
-    
-    # Plot 2: Wavelet coefficients
+    # Plot 2: Reconstruction Error
     ax2 = axes[1]
-    coeff_indices = np.arange(len(wavelet_coeffs))
-    
-    ax2.stem(coeff_indices, wavelet_coeffs, basefmt=' ', linefmt='g-', markerfmt='go')
-    ax2.set_xlabel('Coefficient Index', fontsize=12)
-    ax2.set_ylabel('Coefficient Value', fontsize=12)
-    ax2.set_title(f'Wavelet Coefficients (cA only, n={len(wavelet_coeffs)})', fontsize=14, fontweight='bold')
+    error = original - reconstructed
+    ax2.plot(error, label='Error (Original - Reconstructed)', color='red', linewidth=2)
+    ax2.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    ax2.set_title('Reconstruction Error')
+    ax2.set_xlabel('Time Step')
+    ax2.set_ylabel('Error')
+    ax2.legend()
     ax2.grid(True, alpha=0.3)
     
-    # Add coefficient statistics
-    coeff_stats = f'Mean: {np.mean(wavelet_coeffs):.4f}\nStd: {np.std(wavelet_coeffs):.4f}\nMax: {np.max(np.abs(wavelet_coeffs)):.4f}'
-    ax2.text(0.98, 0.98, coeff_stats, transform=ax2.transAxes, 
-            fontsize=10, verticalalignment='top', horizontalalignment='right',
-            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+    # Add error statistics
+    mse = np.mean(error ** 2)
+    mae = np.mean(np.abs(error))
+    max_error = np.max(np.abs(error))
+    
+    stats_text = f'MSE: {mse:.6f}\nMAE: {mae:.6f}\nMax Error: {max_error:.6f}'
+    ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     plt.tight_layout()
     
     # Save plot
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"reconstruction_debug_{feature_name.replace(' ', '_')}_{window_type}_{timestamp}.png"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_feature_name = feature_name.replace('/', '_').replace(' ', '_')
+    filename = output_dir / f"{safe_feature_name}_{window_type}.png"
     plt.savefig(filename, dpi=150, bbox_inches='tight')
-    print(f"\n💾 Saved plot to: {filename}")
+    plt.close()
     
-    plt.show()
+    print(f"   ✓ Saved plot to {filename}")
 
 
 async def main():
-    """Main function."""
-    parser = argparse.ArgumentParser(description='Debug wavelet + PCA reconstruction quality')
-    parser.add_argument('--model-id', type=str, default="372d48f3-b9c0-4f5e-b7d0-547a2505386a",
-                        help='Model ID to analyze')
-    parser.add_argument('--sample-idx', type=int, default=0,
-                        help='Sample index to use (0-based)')
-    parser.add_argument('--feature', type=str, default=None,
-                        help='Specific feature to analyze (if not provided, analyzes all)')
-    parser.add_argument('--window-type', type=str, default=None,
-                        choices=['past', 'future_conditioning_series', 'future_target_residuals'],
-                        help='Specific window type to analyze (if not provided, analyzes all)')
-    parser.add_argument('--output-dir', type=str, default='.',
-                        help='Directory to save plots')
-    
+    parser = argparse.ArgumentParser(description="Debug reconstruction quality using ReconstructionEngine")
+    parser.add_argument('--model-id', type=str, help="Model ID (default: latest trained model)")
+    parser.add_argument('--sample-idx', type=int, default=0, help="Sample index to use (default: 0)")
+    parser.add_argument('--feature', type=str, help="Specific feature to reconstruct (default: all)")
+    parser.add_argument('--window', type=str, choices=['past', 'future_conditioning_series', 'future_target_residuals'],
+                       help="Specific window to reconstruct (default: all)")
+    parser.add_argument('--output-dir', type=str, default='reconstruction_plots',
+                       help="Output directory for plots (default: reconstruction_plots)")
     args = parser.parse_args()
     
+    output_dir = Path(args.output_dir)
+    
     print("=" * 80)
-    print("🔬 WAVELET + PCA RECONSTRUCTION DEBUGGER")
+    print("🔬 RECONSTRUCTION DEBUGGER (Using ReconstructionEngine)")
     print("=" * 80)
     
-    # Load data
-    data = await load_sample_and_encoders(args.model_id, args.sample_idx)
+    # Load model
+    if args.model_id:
+        model_id = args.model_id
+        # Get user_id from model
+        db = CloudSQLManager()
+        model = await db.get_model(model_id)
+        if not model:
+            raise ValueError(f"Model {model_id} not found")
+        user_id = str(model['user_id'])
+    else:
+        model_id, user_id = await load_latest_model()
     
-    # Get sample metadata
-    sample_norm = data['sample_norm']
-    sample_enc = data['sample_enc']
-    metadata = json.loads(sample_norm.get('metadata', '{}')) if isinstance(sample_norm.get('metadata'), str) else sample_norm.get('metadata', {})
+    # Initialize ReconstructionEngine
+    print("\n🔧 Initializing ReconstructionEngine...")
+    engine = ReconstructionEngine(model_id, user_id)
+    await engine.initialize()
     
-    # Add component_metadata from encoded sample (this contains the ranges for slicing)
-    component_metadata = json.loads(sample_enc.get('component_metadata', '{}')) if isinstance(sample_enc.get('component_metadata'), str) else sample_enc.get('component_metadata', {})
-    metadata['component_metadata'] = component_metadata
+    # Load feature groups (needed to resolve group IDs to individual feature names)
+    engine.feature_groups = await engine.get_feature_groups()
+    if engine.feature_groups:
+        # Build feature_to_group_map for reverse lookup
+        # Use 'name' not 'id' for group identification
+        for group in engine.feature_groups.get('conditioning_groups', []) + engine.feature_groups.get('target_groups', []):
+            group_name = group.get('name')  # Use 'name' not 'id'
+            for feature in group.get('features', []):
+                engine.feature_to_group_map[feature] = group_name
+        print(f"   ✓ Loaded {len(engine.feature_groups.get('conditioning_groups', []))} conditioning groups and {len(engine.feature_groups.get('target_groups', []))} target groups")
+    
+    print(f"   ✓ Loaded {len(engine.encoding_models)} encoding models (3-tuple keys: group_id, window_type, regime_id)")
+    print(f"   ✓ Loaded {len(engine.normalization_params)} normalization params")
+    
+    # Load sample
+    sample_norm, sample_enc = await load_sample(model_id, user_id, args.sample_idx)
+    
+    # Extract feature info
+    feature_info_list = extract_feature_info(sample_enc)
+    
+    # Build list of windows to process
+    windows_to_process = []
+    
+    # Get all unique features from feature_info
+    all_features = set()
+    for info in feature_info_list:
+        feature_id = info.get('feature', '')
+        group_features = info.get('group_features', [])
+        
+        # Add all features from the group
+        if group_features:
+            all_features.update(group_features)
+        else:
+            all_features.add(feature_id)
+    
+    print(f"\n📋 Available features: {sorted(all_features)}")
     
     # Determine which features and windows to process
-    window_configs = []
+    features_to_process = [args.feature] if args.feature else sorted(all_features)
+    windows_to_process_types = [args.window] if args.window else ['past', 'future_conditioning_series', 'future_target_residuals']
     
-    if args.feature and args.window_type:
-        # Single feature/window
-        window_configs.append((args.feature, args.window_type))
-    elif args.window_type:
-        # All features for a specific window type
-        order_key = {
-            'past': 'feature_order_past',
-            'future_conditioning_series': 'feature_order_future_conditioning_series',
-            'future_target_residuals': 'feature_order_target'
-        }[args.window_type]
-        features = metadata.get(order_key, [])
-        window_configs = [(feat, args.window_type) for feat in features]
-    elif args.feature:
-        # Single feature, all window types
-        for window_type in ['past', 'future_conditioning_series', 'future_target_residuals']:
-            order_key = {
-                'past': 'feature_order_past',
-                'future_conditioning_series': 'feature_order_future_conditioning_series',
-                'future_target_residuals': 'feature_order_target'
-            }[window_type]
-            features = metadata.get(order_key, [])
-            if args.feature in features:
-                window_configs.append((args.feature, window_type))
-    else:
-        # All features, all window types
-        for window_type in ['past', 'future_conditioning_series', 'future_target_residuals']:
-            order_key = {
-                'past': 'feature_order_past',
-                'future_conditioning_series': 'feature_order_future_conditioning_series',
-                'future_target_residuals': 'feature_order_target'
-            }[window_type]
-            features = metadata.get(order_key, [])
-            window_configs.extend([(feat, window_type) for feat in features])
+    print(f"\n📊 Will process {len(features_to_process)} features × {len(windows_to_process_types)} windows = {len(features_to_process) * len(windows_to_process_types)} combinations")
     
-    print(f"\n📊 Processing {len(window_configs)} feature/window combinations...")
+    # Process each combination
+    success_count = 0
+    error_count = 0
     
-    # Create output directory if needed
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    for feature in features_to_process:
+        for window_type in windows_to_process_types:
+            try:
+                print(f"\n{'='*60}")
+                results = await reconstruct_window_with_engine(
+                    engine=engine,
+                    sample_norm=sample_norm,
+                    sample_enc=sample_enc,
+                    feature_name=feature,
+                    window_type=window_type
+                )
+                
+                # Skip if the feature/window combination doesn't exist
+                if results is None or (isinstance(results, tuple) and results[0] is None):
+                    continue
+                
+                # results is a list of (feature_name, original, reconstructed, wavelet_only) tuples
+                for feat_name, original, reconstructed, wavelet_only in results:
+                    plot_reconstruction(
+                        feature_name=feat_name,
+                        window_type=window_type,
+                        original=original,
+                        reconstructed=reconstructed,
+                        wavelet_only=wavelet_only,
+                        output_dir=output_dir
+                    )
+                
+                success_count += len(results)
+                
+            except Exception as e:
+                print(f"   ❌ Error: {e}")
+                import traceback
+                traceback.print_exc()
+                error_count += 1
     
-    # Process each feature/window
-    results = []
-    for i, (feature_name, window_type) in enumerate(window_configs, 1):
-        print(f"\n[{i}/{len(window_configs)}] Processing {feature_name} ({window_type})")
-        
-        try:
-            # Get normalized and encoded data
-            data_key_map = {
-                'past': ('normalized_past', 'encoded_past_series'),
-                'future_conditioning_series': ('normalized_future_conditioning_series', 'encoded_future_conditioning_series'),
-                'future_target_residuals': ('normalized_future_target_residuals', 'encoded_future_target_residuals')
-            }
-            norm_key, enc_key = data_key_map[window_type]
-            normalized_data = sample_norm.get(norm_key, [])
-            encoded_data = sample_enc.get(enc_key, [])
-            
-            # Reconstruct
-            original, reconstructed, reconstructed_wavelet_only, wavelet_coeffs = reconstruct_window(
-                feature_name=feature_name,
-                window_type=window_type,
-                normalized_data=normalized_data,
-                encoded_data=encoded_data,
-                wavelet_config=data['wavelet_config'],
-                pca_models=data['pca_models'],
-                feature_groups=data['feature_groups'],
-                metadata=metadata,
-            )
-            
-            # Calculate metrics
-            if len(reconstructed) == len(original):
-                mse_pca = np.mean((original - reconstructed) ** 2)
-                mae_pca = np.mean(np.abs(original - reconstructed))
-                corr_pca = np.corrcoef(original, reconstructed)[0, 1]
-            else:
-                mse_pca = mae_pca = corr_pca = np.nan
-            
-            if len(reconstructed_wavelet_only) == len(original):
-                mse_wav = np.mean((original - reconstructed_wavelet_only) ** 2)
-                mae_wav = np.mean(np.abs(original - reconstructed_wavelet_only))
-                corr_wav = np.corrcoef(original, reconstructed_wavelet_only)[0, 1]
-            else:
-                mse_wav = mae_wav = corr_wav = np.nan
-            
-            results.append({
-                'feature': feature_name,
-                'window_type': window_type,
-                'mse_wavelet': mse_wav,
-                'mae_wavelet': mae_wav,
-                'corr_wavelet': corr_wav,
-                'mse_pca_wavelet': mse_pca,
-                'mae_pca_wavelet': mae_pca,
-                'corr_pca_wavelet': corr_pca,
-            })
-            
-            # Plot (save to output directory)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = output_dir / f"reconstruction_{feature_name.replace(' ', '_')}_{window_type}_{timestamp}.png"
-            
-            # Create plot
-            fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-            
-            # Plot 1: Time series comparison
-            ax1 = axes[0]
-            time_steps = np.arange(len(original))
-            
-            ax1.plot(time_steps, original, 'b-', linewidth=2.5, label='Original (Normalized)', alpha=0.8)
-            ax1.plot(time_steps, reconstructed_wavelet_only, 'g--', linewidth=2, label='Wavelet-Only', alpha=0.7)
-            ax1.plot(time_steps, reconstructed, 'r--', linewidth=2, label='PCA+Wavelet', alpha=0.7)
-            
-            ax1.set_xlabel('Time Step', fontsize=12)
-            ax1.set_ylabel('Normalized Value', fontsize=12)
-            ax1.set_title(f'{feature_name} - {window_type}\nOriginal vs Reconstructed', fontsize=14, fontweight='bold')
-            ax1.legend(fontsize=10, loc='best')
-            ax1.grid(True, alpha=0.3)
-            
-            # Add metrics
-            metrics_text = f'Wavelet-Only:\n  MSE: {mse_wav:.6f}\n  MAE: {mae_wav:.6f}\n  Corr: {corr_wav:.4f}\n'
-            metrics_text += f'PCA+Wavelet:\n  MSE: {mse_pca:.6f}\n  MAE: {mae_pca:.6f}\n  Corr: {corr_pca:.4f}'
-            ax1.text(0.02, 0.98, metrics_text, transform=ax1.transAxes, 
-                    fontsize=9, verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5), family='monospace')
-            
-            # Plot 2: Wavelet coefficients
-            ax2 = axes[1]
-            coeff_indices = np.arange(len(wavelet_coeffs))
-            
-            ax2.stem(coeff_indices, wavelet_coeffs, basefmt=' ', linefmt='g-', markerfmt='go')
-            ax2.set_xlabel('Coefficient Index', fontsize=12)
-            ax2.set_ylabel('Coefficient Value', fontsize=12)
-            ax2.set_title(f'Wavelet Coefficients (cA only, n={len(wavelet_coeffs)})', fontsize=14, fontweight='bold')
-            ax2.grid(True, alpha=0.3)
-            
-            coeff_stats = f'Mean: {np.mean(wavelet_coeffs):.4f}\nStd: {np.std(wavelet_coeffs):.4f}\nMax: {np.max(np.abs(wavelet_coeffs)):.4f}'
-            ax2.text(0.98, 0.98, coeff_stats, transform=ax2.transAxes, 
-                    fontsize=10, verticalalignment='top', horizontalalignment='right',
-                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
-            
-            plt.tight_layout()
-            plt.savefig(filename, dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            print(f"   ✓ Saved to {filename}")
-            
-        except Exception as e:
-            print(f"   ✗ Error: {e}")
-            results.append({
-                'feature': feature_name,
-                'window_type': window_type,
-                'error': str(e)
-            })
-    
-    # Print summary
-    print("\n" + "=" * 80)
-    print("📊 RECONSTRUCTION QUALITY SUMMARY")
-    print("=" * 80)
-    
-    for result in results:
-        if 'error' in result:
-            print(f"\n❌ {result['feature']} ({result['window_type']}): {result['error']}")
-        else:
-            print(f"\n✅ {result['feature']} ({result['window_type']}):")
-            print(f"   Wavelet-Only:  MSE={result['mse_wavelet']:.6f}, Corr={result['corr_wavelet']:.4f}")
-            print(f"   PCA+Wavelet:   MSE={result['mse_pca_wavelet']:.6f}, Corr={result['corr_pca_wavelet']:.4f}")
-    
-    print("\n✅ Done!")
+    print(f"\n{'='*80}")
+    print(f"✅ Done! {success_count} successful, {error_count} errors")
+    print(f"📁 Plots saved to {output_dir}/")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
