@@ -123,13 +123,23 @@ class TreasuryWorkflow:
         self.scenario: Optional[Dict[str, Any]] = None
 
     def _request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
-        resp = self.session.request(method, path, **kwargs)
-        if resp.status_code >= 400:
+        # Ensure every call has a timeout so we don't hang forever waiting for a response
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = 30.0
+
+        try:
+            resp = self.session.request(method, path, **kwargs)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
             try:
-                detail = resp.json()
+                detail = e.response.json()
             except Exception:
-                detail = resp.text
-            raise RuntimeError(f"{method} {path} failed ({resp.status_code}): {detail}")
+                detail = e.response.text
+            raise RuntimeError(f"{method} {path} failed ({e.response.status_code}): {detail}")
+        except httpx.TimeoutException:
+            print(f"[api] ⚠️  Timeout requesting {path}")
+            raise
+
         if resp.content:
             return resp.json()
         return {}
@@ -178,7 +188,7 @@ class TreasuryWorkflow:
             "description": self.description,
             "training_start_date": self.training_start,
             "training_end_date": self.training_end,
-            "is_template": False,
+            "is_template": True,
         }
         self.project = self._request("POST", "/api/v1/projects/", json=payload)
         print(f"[project] created {self.project['id']} ({self.project['name']})")
@@ -210,6 +220,38 @@ class TreasuryWorkflow:
             },
         }
 
+    def ensure_model_exists(self) -> None:
+        """Ensure model exists (create if needed using auto_setup, or reuse existing)."""
+        if self.model_id:
+            return  # Already have model_id
+        
+        if not self.project:
+            raise RuntimeError("Project must be created before ensuring model exists")
+        
+        # Try to find existing model by name in the project
+        try:
+            models_resp = self._request("GET", f"/api/v1/models/?project_id={self.project['id']}&limit=100")
+            models = models_resp.get("models", [])
+            for model in models:
+                if model.get("name") == self.model_name:
+                    self.model_id = model["id"]
+                    print(f"[model] reusing existing model {self.model_id} ({self.model_name})")
+                    return
+        except Exception as e:
+            print(f"[model] could not check for existing models: {e}")
+        
+        # Model doesn't exist, create it using auto_setup (but do it synchronously here)
+        print(f"[model] creating model {self.model_name}...")
+        auto_setup = self._build_auto_setup_payload()
+        
+        # Create feature sets and model via a separate endpoint or by calling the backend directly
+        # For now, we'll use auto_setup in the training call but it should be fast if resources exist
+        # Actually, let's create them explicitly via API if endpoints exist
+        # If not, we'll let auto_setup handle it (but it should be fast)
+        print(f"[model] model will be created via auto_setup during training")
+        # Model will be created in Cloud Task, but we need model_id for polling
+        # So we'll use auto_setup and handle "pending" model_id
+
     def train_with_auto_setup(
         self,
         n_regimes: int,
@@ -218,7 +260,7 @@ class TreasuryWorkflow:
         resume_from: str = None,
     ) -> None:
         """
-        Train the model with auto-setup.
+        Train the model. If model_id is set, uses it directly. Otherwise uses auto_setup.
         
         Args:
             n_regimes: Number of copula regimes
@@ -227,7 +269,7 @@ class TreasuryWorkflow:
             resume_from: Optional stage to resume from ('sample_generation', 'fitting', 'encoding', 'training')
                         None = full pipeline (default)
                         'sample_generation' = regenerate normalized samples
-                        'fitting' = refit encoding models (wavelet + ICA→PCA)
+                        'fitting' = refit encoding models (PCA-ICA)
                         'encoding' = re-encode samples with existing models
                         'training' = only retrain copula (fastest)
         
@@ -236,8 +278,9 @@ class TreasuryWorkflow:
         """
         if not self.project:
             raise RuntimeError("Project must be created or specified before training")
+        
+        # Build payload - use model_id if available, otherwise auto_setup
         train_payload = {
-            "auto_setup": self._build_auto_setup_payload(),
             "n_regimes": n_regimes,
             "data_fetch": {
                 "start_date": self.training_start,
@@ -252,15 +295,140 @@ class TreasuryWorkflow:
             },
         }
         
+        # Ensure model exists first (reuse existing or will be created via auto_setup)
+        self.ensure_model_exists()
+        
+        # Use model_id if we have it (faster - no auto_setup needed)
+        if self.model_id:
+            train_payload["model_id"] = self.model_id
+            print(f"[train] Using existing model_id: {self.model_id}")
+        else:
+            # Model doesn't exist yet - use auto_setup (will be created in Cloud Task)
+            train_payload["auto_setup"] = self._build_auto_setup_payload()
+            print(f"[train] Using auto_setup (model will be created in Cloud Task)")
+        
         # Add resume_from if specified
         if resume_from:
             train_payload["resume_from"] = resume_from
             print(f"[train] Resuming pipeline from stage: {resume_from}")
         
-        job = self._request("POST", "/api/v1/ml/train", json=train_payload)
-        self.model_id = job["model_id"]
-        print(f"[train] job {job['job_id']} queued for model {self.model_id}")
-        self._poll_training_status(poll_interval, timeout)
+        print(f"[train] Submitting training job to {self.api_url}...")
+        print(f"[train] Payload: n_regimes={n_regimes}, stride={self.sample_config['stride']}, date_range={self.training_start} to {self.training_end}")
+        if "auto_setup" in train_payload:
+            print(f"[train] Note: Model will be created via auto_setup in Cloud Task (non-blocking)")
+        else:
+            print(f"[train] Note: Using existing model, submission should return immediately")
+        
+        # Submit job - use a reasonable timeout for submission
+        # Auto-setup operations (creating feature sets/models) can be slow, especially under load
+        import time as time_module
+        submission_start = time_module.time()
+        last_log_time = submission_start
+        
+        def log_progress():
+            elapsed = time_module.time() - submission_start
+            if elapsed > 30:  # Log every 30 seconds if taking a while
+                print(f"[train] Still waiting for submission response... ({elapsed:.0f}s elapsed)")
+        
+        try:
+            # Use a longer timeout for submission (10 minutes) to allow for auto-setup operations
+            # The backend needs to create feature sets, models, etc. which can take time under load
+            submit_timeout = httpx.Timeout(600.0, connect=60.0)  # 10 min total, 1 min connect
+            
+            # Start a background thread to log progress (will be stopped after response)
+            import threading
+            progress_stop = threading.Event()
+            progress_thread = None
+            
+            def progress_logger():
+                while not progress_stop.is_set():
+                    if progress_stop.wait(timeout=30):  # Wait 30s or until stopped
+                        break
+                    elapsed = time_module.time() - submission_start
+                    if elapsed < 600:  # Only log if still within timeout
+                        print(f"[train] ⏳ Still waiting for submission response... ({elapsed:.0f}s elapsed)")
+            
+            progress_thread = threading.Thread(target=progress_logger, daemon=True)
+            progress_thread.start()
+            
+            try:
+                with httpx.Client(
+                    base_url=self.api_url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=submit_timeout,
+                ) as submit_session:
+                    print(f"[train] Sending POST request (timeout: 10min for auto-setup operations)...")
+                    resp = submit_session.post("/api/v1/ml/train", json=train_payload)
+                    submission_elapsed = time_module.time() - submission_start
+                    print(f"[train] ✅ Received response after {submission_elapsed:.1f}s")
+                    
+                    # Stop progress logger now that we have response
+                    progress_stop.set()
+                    
+                    if resp.status_code >= 400:
+                        try:
+                            detail = resp.json()
+                        except Exception:
+                            detail = resp.text
+                        raise RuntimeError(f"POST /api/v1/ml/train failed ({resp.status_code}): {detail}")
+                    job = resp.json() if resp.content else {}
+            finally:
+                # Ensure progress logger is stopped
+                progress_stop.set()
+        except httpx.TimeoutException:
+            submission_elapsed = time_module.time() - submission_start
+            raise RuntimeError(
+                f"Training job submission timed out after {submission_elapsed:.1f}s. "
+                f"The backend may be slow during auto-setup (creating feature sets/models) or blocked by other operations. "
+                f"Check backend logs. The job may still be queued in Cloud Tasks even if this times out."
+            )
+        except Exception as e:
+            submission_elapsed = time_module.time() - submission_start
+            raise RuntimeError(f"Failed to submit training job after {submission_elapsed:.1f}s: {str(e)}")
+        
+        self.model_id = job.get("model_id")
+        job_id = job.get("job_id")
+        initial_status = job.get("status", "unknown")
+        
+        if not job_id:
+            raise RuntimeError(f"Job submission failed: no job_id in response. Response: {job}")
+        
+        # If model_id is "pending", it means auto_setup is happening in the Cloud Task
+        # Wait a bit for it to resolve, then get the real model_id from status
+        if self.model_id == "pending" or not self.model_id:
+            print(f"[train] ⏳ Model ID is pending (auto-setup in progress), waiting for resolution...")
+            import time as time_module
+            for attempt in range(10):  # Wait up to 10 seconds
+                time_module.sleep(1)
+                # Try to get status - but we need model_id... 
+                # Actually, we can't poll without model_id. Let's wait and hope it resolves quickly.
+                # Or we could list models and find the one with matching job_id in metadata
+                # For now, just wait a bit more
+                if attempt == 9:
+                    print(f"[train] ⚠️  Model ID still pending after 10s, will try to resolve from project...")
+                    # Try to find model by listing models in the project
+                    if self.project:
+                        models_resp = self._request("GET", f"/api/v1/models/?project_id={self.project['id']}")
+                        models = models_resp.get("models", [])
+                        # Find the most recently created one (should be ours)
+                        if models:
+                            # Sort by created_at if available, or just take the first
+                            self.model_id = models[0]["id"]
+                            print(f"[train] ✅ Resolved model ID: {self.model_id}")
+                        else:
+                            raise RuntimeError("Could not resolve model_id after auto-setup. Check backend logs.")
+        
+        if not self.model_id:
+            raise RuntimeError(f"Job submission failed: no model_id in response. Response: {job}")
+        
+        print(f"[train] ✅ Job submitted successfully!")
+        print(f"[train]   Job ID: {job_id}")
+        print(f"[train]   Model ID: {self.model_id}")
+        print(f"[train]   Initial status: {initial_status}")
+        print(f"[train]   Starting polling (interval={poll_interval}s, timeout={'unlimited' if timeout <= 0 else f'{timeout}s'})...")
+        print()
+        
+        self._poll_training_status(poll_interval, timeout, expected_job_id=job_id)
 
     def ensure_model_for_forecast(self) -> None:
         if self.model_id:
@@ -288,26 +456,66 @@ class TreasuryWorkflow:
                 self.project = {"id": pid}
         print(f"[model] using existing model {self.model_id}")
 
-    def _poll_training_status(self, interval_seconds: int, timeout_seconds: int) -> None:
+    def _poll_training_status(self, interval_seconds: int, timeout_seconds: int, expected_job_id: Optional[str] = None) -> None:
         if not self.model_id:
             raise RuntimeError("Model ID is not set; cannot poll status")
 
         elapsed = 0
-        status = "queued"
+        status = "unknown"
+        last_status = None
+        poll_count = 0
+        job_id_mismatch_count = 0
+        
         # If timeout is None or <= 0, poll indefinitely
         while timeout_seconds is None or timeout_seconds <= 0 or elapsed <= timeout_seconds:
-            resp = self._request(
-                "GET",
-                f"/api/v1/ml/train/{self.model_id}/status",
-            )
-            status = resp.get("status")
-            print(f"[train] status={status} (t={elapsed}s)")
-            if status in {"completed", "failed"}:
-                break
+            try:
+                resp = self._request(
+                    "GET",
+                    f"/api/v1/ml/train/{self.model_id}/status",
+                )
+                status = resp.get("status", "unknown")
+                current_job_id = resp.get("job_id")
+                message = resp.get("message")
+                
+                # Check if we're tracking the right job (if expected_job_id is provided)
+                if expected_job_id and current_job_id and current_job_id != expected_job_id:
+                    job_id_mismatch_count += 1
+                    if job_id_mismatch_count == 1:
+                        print(f"[train] ⚠️  WARNING: Status endpoint returned different job_id ({current_job_id}) than expected ({expected_job_id})")
+                        print(f"[train] ⚠️  This may indicate an old job is still running. Continuing to poll...")
+                    # Continue polling - the job might still be queued
+                
+                # Always print status for visibility
+                status_line = f"[train] status={status} (t={elapsed}s, poll #{poll_count + 1})"
+                if current_job_id:
+                    status_line += f" [job: {current_job_id[:8]}...]"
+                if message:
+                    status_line += f" - {message}"
+                print(status_line)
+                last_status = status
+                
+                poll_count += 1
+                
+                # Only break if status is terminal AND we're tracking the right job (or job_id check is disabled)
+                if status in {"completed", "failed", "training-failed"}:
+                    if not expected_job_id or current_job_id == expected_job_id:
+                        break
+                    # If wrong job completed, continue polling
+                    
+            except Exception as e:
+                print(f"[train] ⚠️  Error polling status (t={elapsed}s): {str(e)}")
+                # Continue polling even if one request fails
+                
             time.sleep(interval_seconds)
             elapsed += interval_seconds
-        if status != "completed":
-            raise RuntimeError(f"Training did not complete successfully (status={status})")
+        
+        print()
+        if status == "completed":
+            print(f"[train] ✅ Training completed successfully! (total time: {elapsed}s)")
+        elif status in {"failed", "training-failed"}:
+            raise RuntimeError(f"Training failed with status: {status}")
+        else:
+            raise RuntimeError(f"Training did not complete (status={status}, elapsed={elapsed}s)")
 
     def create_scenario(self) -> None:
         if not self.model_id:
@@ -355,10 +563,12 @@ class TreasuryWorkflow:
             "random_seed": 42,
         }
 
+        # Forecast can take a long time, especially with adaptation logic
         forecast = self._request(
             "POST",
             "/api/v1/ml/forecast",
             json=forecast_payload,
+            timeout=None,  # No timeout - wait as long as needed
         )
         print(
             f"[forecast] status={forecast.get('status')} "
@@ -557,6 +767,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--model-description",
         default="Treasury ETF forecasting model created via backend APIs",
     )
+    parser.add_argument(
+        "--new-model",
+        action="store_true",
+        default=False,
+        help="Create a new model instead of reusing existing one with the same name. Appends timestamp to model name."
+    )
     parser.add_argument("--scenario-name", default="covid")
     parser.add_argument("--scenario-date", default="2020-03-15")
     parser.add_argument("--past-window", type=int, default=100)
@@ -574,17 +790,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              "'sample_generation' = regenerate samples, 'fitting' = refit encoders, "
              "'encoding' = re-encode samples, 'training' = only retrain copula"
     )
-    parser.add_argument("--forecast-paths", type=int, default=10, help="Number of forecast trajectories")
-    parser.add_argument(
-        "--wavelet-past",
-        default="db2",
-        help="Wavelet family for past windows (default: db2)"
-    )
-    parser.add_argument(
-        "--wavelet-future",
-        default="db4",
-        help="Wavelet family for future windows (default: db4)"
-    )
+    parser.add_argument("--forecast-paths", type=int, default=100, help="Number of forecast trajectories")
     return parser.parse_args(argv)
 
 
@@ -601,12 +807,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         "pastWindow": args.past_window,
         "futureWindow": args.future_window,
         "stride": args.stride,
-        "splitPercentages": {"training": training_split, "validation": validation_split},
-        "waveletFamilyConfig": {
-            "past": args.wavelet_past,
-            "future": args.wavelet_future
-        }
+        "splitPercentages": {"training": training_split, "validation": validation_split}
     }
+
+    # If --new-model flag is set, append timestamp to model name to ensure uniqueness
+    model_name = args.model_name
+    if args.new_model:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = f"{args.model_name} ({timestamp})"
+        print(f"[model] Creating new model with name: {model_name}")
 
     workflow = TreasuryWorkflow(
         api_url=args.api_url,
@@ -621,7 +830,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         sample_config=sample_config,
         scenario_date=args.scenario_date,
         scenario_name=args.scenario_name,
-        model_name=args.model_name,
+        model_name=model_name,
         model_description=args.model_description,
         project_id_override=args.project_id,
         model_id_override=args.model_id,

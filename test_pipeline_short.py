@@ -32,8 +32,6 @@ if __name__ == "__main__":
         "--model-description", "Fast iteration model with shorter date range",
         "--training-timeout", "0",  # No timeout - wait as long as needed
         "--poll-interval", "5",
-        "--wavelet-past", "db2",  # Coarser decomposition for past
-        "--wavelet-future", "db4",  # Better reconstruction for future
     ]
     
     # Check if user passed --stage argument

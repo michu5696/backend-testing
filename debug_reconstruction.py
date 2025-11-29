@@ -38,6 +38,12 @@ else:
 
 from cloudsql_client import CloudSQLManager
 from services.pipeline.reconstruct import ReconstructionEngine
+import logging
+
+# Suppress warnings from ReconstructionEngine about missing models (expected behavior)
+# when clustering finds fewer regimes than metadata suggests
+reconstruct_logger = logging.getLogger('services.pipeline.reconstruct')
+reconstruct_logger.setLevel(logging.ERROR)  # Only show errors, not warnings about missing models
 
 
 async def load_latest_model():
@@ -260,6 +266,7 @@ async def reconstruct_window_with_engine(
     feature_range = None
     matched_group_features = []
     
+    matched_feature_info = None
     for info in feature_info_list:
         info_feature = info.get('feature', '')  # This is the group ID or feature name
         info_temporal = info.get('temporal_tag', '')
@@ -281,9 +288,15 @@ async def reconstruct_window_with_engine(
             if feature_match:
                 feature_range = info.get('range', [])
                 matched_group_features = group_features if group_features else [info_feature]
+                matched_feature_info = info  # Store for later use
                 print(f"   ✓ Found encoded range: {feature_range}")
                 print(f"     Feature/Group ID: {info_feature}")
                 print(f"     Temporal: {info_temporal}, Data type: {info_data_type}")
+                # Log regime info from feature_info if available
+                info_n_regimes = info.get('n_regimes', None)
+                info_has_regime_indicator = info.get('has_regime_indicator', None)
+                if info_n_regimes is not None:
+                    print(f"     Regime info from metadata: n_regimes={info_n_regimes}, has_indicator={info_has_regime_indicator}")
                 break
     
     if feature_range is None or len(feature_range) != 2:
@@ -354,6 +367,17 @@ async def reconstruct_window_with_engine(
     # We need to check how many regimes exist for this (group, window) combination
     n_regimes = 0
     lookup_group_id = group_id if group_id else feature_name
+    available_regimes = []
+    
+    # First, try to get regime info from feature_info metadata (most reliable)
+    if matched_feature_info:
+        info_n_regimes = matched_feature_info.get('n_regimes', None)
+        info_has_regime_indicator = matched_feature_info.get('has_regime_indicator', None)
+        if info_n_regimes is not None:
+            n_regimes = info_n_regimes
+            print(f"   📋 Using regime info from feature_info metadata: n_regimes={n_regimes}")
+    
+    # Also find available regime IDs from encoding models (for verification)
     if lookup_group_id:
         # Find available regime IDs for this (group, window)
         # Use model_window_type for lookup
@@ -362,13 +386,47 @@ async def reconstruct_window_with_engine(
             if isinstance(key, tuple) and len(key) == 3 
             and key[0] == lookup_group_id and key[1] == model_window_type
         ]
-        n_regimes = len(available_regimes)
+        # If we didn't get n_regimes from metadata, use model count
+        if n_regimes == 0:
+            n_regimes = len(available_regimes)
+            print(f"   📋 Using regime info from encoding models: n_regimes={n_regimes}")
+        
+        # Verify consistency
+        if matched_feature_info and matched_feature_info.get('n_regimes') is not None:
+            if n_regimes != matched_feature_info.get('n_regimes'):
+                print(f"   ⚠️  WARNING: Mismatch between feature_info n_regimes ({matched_feature_info.get('n_regimes')}) and model count ({n_regimes})")
     
-    # If n_regimes > 1, the encoded_slice includes a regime indicator as the last element
-    # But we should NOT strip it here - let ReconstructionEngine handle it
-    # The feature_info range already accounts for the regime indicator if present
+    # Diagnostic: Extract and log regime indicator if present (for debugging)
+    # Note: We don't strip it here - ReconstructionEngine will handle it
+    regime_indicator_value = None
+    actual_regime_id = None
+    if n_regimes > 1 and len(encoded_slice) > 0:
+        regime_indicator_value = float(encoded_slice[-1])
+        # Round to nearest valid regime ID (same logic as ReconstructionEngine)
+        actual_regime_id = int(min(available_regimes, key=lambda x: abs(x - regime_indicator_value)))
+        print(f"   🔢 Regimes: {n_regimes} available {available_regimes}")
+        print(f"   📌 Regime indicator in encoded data: {regime_indicator_value:.4f} → will use regime {actual_regime_id}")
+        print(f"   📊 Encoded coefficients: {len(encoded_slice)} total ({len(encoded_slice)-1} PCA/ICA + 1 regime indicator)")
+        
+        # Verify the encoding model exists for this regime
+        model_key = (lookup_group_id, model_window_type, actual_regime_id)
+        if model_key in engine.encoding_models:
+            model_info = engine.encoding_models[model_key]
+            n_components = model_info.get('n_components', 'unknown')
+            print(f"   ✅ Encoding model found: {model_key} (n_components={n_components})")
+        else:
+            print(f"   ⚠️  WARNING: Encoding model not found for {model_key}")
+    else:
+        print(f"   🔢 Regimes: {n_regimes} (single regime, no indicator)")
+        if n_regimes == 1 and len(available_regimes) > 0:
+            actual_regime_id = available_regimes[0]
+            model_key = (lookup_group_id, model_window_type, actual_regime_id)
+            if model_key in engine.encoding_models:
+                model_info = engine.encoding_models[model_key]
+                n_components = model_info.get('n_components', 'unknown')
+                print(f"   ✅ Encoding model: {model_key} (n_components={n_components})")
     
-    print(f"   Regimes available: {n_regimes} (regime indicator handling done by ReconstructionEngine)")
+    print(f"   📝 Note: ReconstructionEngine will extract regime indicator and select correct model")
     
     # Build window dict for ReconstructionEngine
     # Must include feature, temporal_tag, data_type, and the encoded data
@@ -490,16 +548,13 @@ async def reconstruct_window_with_engine(
             mae = np.mean(np.abs(feat_original_denormalized - reconstructed_denormalized))
             max_error = np.max(np.abs(feat_original_denormalized - reconstructed_denormalized))
             
-            # No wavelet-only reconstruction in new architecture (PCA/ICA directly on normalized data)
-            wavelet_only_denormalized = None
-            
             print(f"   ✓ {feat_name}:")
             print(f"      Reconstructed shape: {reconstructed_denormalized.shape}")
             print(f"      Original range: [{np.min(feat_original_denormalized):.4f}, {np.max(feat_original_denormalized):.4f}]")
             print(f"      Reconstructed range: [{np.min(reconstructed_denormalized):.4f}, {np.max(reconstructed_denormalized):.4f}]")
             print(f"      MSE: {mse:.6f}, MAE: {mae:.6f}, Max Error: {max_error:.6f}")
             
-            results.append((feat_name, feat_original_denormalized, reconstructed_denormalized, wavelet_only_denormalized))
+            results.append((feat_name, feat_original_denormalized, reconstructed_denormalized))
     else:
         # Univariate feature: return single feature
         lookup_feature = feature_name
@@ -544,9 +599,6 @@ async def reconstruct_window_with_engine(
                 print(f"   ⚠️  No normalization params found for {feature_name}, using normalized data")
                 original_denormalized = original_normalized
         
-        # No wavelet-only reconstruction in new architecture (PCA/ICA directly on normalized data)
-        wavelet_only_denormalized = None
-        
         # Compute error metrics
         mse = np.mean((original_denormalized - reconstructed_denormalized) ** 2)
         mae = np.mean(np.abs(original_denormalized - reconstructed_denormalized))
@@ -560,7 +612,7 @@ async def reconstruct_window_with_engine(
         print(f"      MAE: {mae:.6f}")
         print(f"      Max Error: {max_error:.6f}")
         
-        results.append((feature_name, original_denormalized, reconstructed_denormalized, wavelet_only_denormalized))
+        results.append((feature_name, original_denormalized, reconstructed_denormalized))
     
     return results
 
@@ -571,7 +623,6 @@ def plot_reconstruction(
     original: np.ndarray,
     reconstructed: np.ndarray,
     output_dir: Path,
-    wavelet_only: np.ndarray = None,
 ):
     """Plot original vs reconstructed time series."""
     fig, axes = plt.subplots(2, 1, figsize=(14, 8))
@@ -580,7 +631,6 @@ def plot_reconstruction(
     ax1 = axes[0]
     ax1.plot(original, label='Original', linewidth=2, alpha=0.8)
     ax1.plot(reconstructed, label='Reconstruction (PCA/ICA)', linewidth=2, alpha=0.8, linestyle='--')
-    # Note: No wavelet-only reconstruction in new architecture
     ax1.set_title(f'{feature_name} ({window_type}): Original vs Reconstructed')
     ax1.set_xlabel('Time Step')
     ax1.set_ylabel('Value')
@@ -650,8 +700,27 @@ async def main():
     
     # Initialize ReconstructionEngine
     print("\n🔧 Initializing ReconstructionEngine...")
-    engine = ReconstructionEngine(model_id, user_id)
-    await engine.initialize()
+    print("   (Note: Missing model warnings are expected if clustering found fewer regimes)")
+    
+    # Suppress warnings during initialization (missing models are expected)
+    import warnings
+    import logging
+    
+    # Temporarily set reconstruct logger to ERROR level to suppress warnings
+    reconstruct_logger = logging.getLogger('services.pipeline.reconstruct')
+    original_level = reconstruct_logger.level
+    reconstruct_logger.setLevel(logging.ERROR)
+    
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            engine = ReconstructionEngine(model_id, user_id)
+            await engine.initialize()
+    finally:
+        # Restore original log level
+        reconstruct_logger.setLevel(original_level)
+    
+    print(f"   ✅ Initialized with {len(engine.encoding_models)} encoding models")
     
     # Load feature groups (needed to resolve group IDs to individual feature names)
     engine.feature_groups = await engine.get_feature_groups()
@@ -716,14 +785,13 @@ async def main():
                 if results is None or (isinstance(results, tuple) and results[0] is None):
                     continue
                 
-                # results is a list of (feature_name, original, reconstructed, wavelet_only) tuples
-                for feat_name, original, reconstructed, wavelet_only in results:
+                # results is a list of (feature_name, original, reconstructed) tuples
+                for feat_name, original, reconstructed in results:
                     plot_reconstruction(
                         feature_name=feat_name,
                         window_type=window_type,
                         original=original,
                         reconstructed=reconstructed,
-                        wavelet_only=wavelet_only,
                         output_dir=output_dir
                     )
                 
