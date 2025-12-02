@@ -488,7 +488,7 @@ class TreasuryWorkflow:
                 # Always print status for visibility
                 status_line = f"[train] status={status} (t={elapsed}s, poll #{poll_count + 1})"
                 if current_job_id:
-                    status_line += f" [job: {current_job_id[:8]}...]"
+                    status_line += f" [job: {current_job_id[:16]}...]"
                 if message:
                     status_line += f" - {message}"
                 print(status_line)
@@ -760,7 +760,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--fred-api-key", default=os.environ.get("FRED_API_KEY", "3d349d18e62cab7c2d55f1a6680f06d8"))
     parser.add_argument("--project-name", default="main project")
     parser.add_argument("--project-description", default="Main project containing all available feature sets and models")
-    parser.add_argument("--training-start", default="2010-01-01")
+    parser.add_argument("--training-start", default="2015-01-01")
     parser.add_argument("--training-end", default="2025-09-01")
     parser.add_argument("--model-name", default="Treasury ETF Forecasting Model (API)")
     parser.add_argument(

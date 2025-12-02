@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 env_path = Path(backend_dir) / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from src.cloudsql_client import CloudSQLManager
+from cloudsql_client import CloudSQLManager
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -28,10 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 # Define the 10 target sets with their assets
+# Mix of individual stocks, ETFs, bonds, commodities, and REITs
+# All assets verified to be available on Yahoo Finance
 TARGET_SETS = [
     {
-        "name": "US Mega Cap Tech",
-        "description": "Large-cap technology companies with highly liquid options markets. Ideal for tech exposure and options strategies.",
+        "name": "US Mega Cap Tech Stocks",
+        "description": "Large-cap technology companies (individual stocks). Highly liquid with active options markets. Ideal for tech exposure and options strategies.",
         "assets": [
             {"id": "AAPL", "name": "Apple Inc"},
             {"id": "MSFT", "name": "Microsoft Corporation"},
@@ -44,7 +46,7 @@ TARGET_SETS = [
         ]
     },
     {
-        "name": "Major ETF Indices",
+        "name": "Major Index ETFs",
         "description": "Highly liquid index ETFs with the most active options markets globally. Perfect for market exposure and hedging.",
         "assets": [
             {"id": "SPY", "name": "SPDR S&P 500 ETF"},
@@ -56,8 +58,8 @@ TARGET_SETS = [
         ]
     },
     {
-        "name": "US Financials",
-        "description": "Major financial institutions and payment networks. Interest rate sensitive with active options trading.",
+        "name": "US Financial Stocks",
+        "description": "Major financial institutions and payment networks (individual stocks). Interest rate sensitive with active options trading.",
         "assets": [
             {"id": "JPM", "name": "JPMorgan Chase & Co"},
             {"id": "BAC", "name": "Bank of America Corp"},
@@ -65,56 +67,40 @@ TARGET_SETS = [
             {"id": "WFC", "name": "Wells Fargo & Company"},
             {"id": "C", "name": "Citigroup Inc"},
             {"id": "MS", "name": "Morgan Stanley"},
-            {"id": "BLK", "name": "BlackRock Inc"},
             {"id": "V", "name": "Visa Inc"},
             {"id": "MA", "name": "Mastercard Inc"},
         ]
     },
     {
-        "name": "Sector ETFs",
-        "description": "SPDR sector ETFs covering all major market sectors. Used for sector rotation and tactical allocation.",
+        "name": "Healthcare & Pharma Stocks",
+        "description": "Major healthcare and pharmaceutical companies (individual stocks). Defensive sector with growth potential.",
         "assets": [
-            {"id": "XLF", "name": "Financial Select Sector SPDR"},
-            {"id": "XLE", "name": "Energy Select Sector SPDR"},
-            {"id": "XLK", "name": "Technology Select Sector SPDR"},
-            {"id": "XLV", "name": "Health Care Select Sector SPDR"},
-            {"id": "XLI", "name": "Industrial Select Sector SPDR"},
-            {"id": "XLY", "name": "Consumer Discretionary Select Sector SPDR"},
-            {"id": "XLP", "name": "Consumer Staples Select Sector SPDR"},
-            {"id": "XLU", "name": "Utilities Select Sector SPDR"},
-            {"id": "XLRE", "name": "Real Estate Select Sector SPDR"},
+            {"id": "JNJ", "name": "Johnson & Johnson"},
+            {"id": "UNH", "name": "UnitedHealth Group Inc"},
+            {"id": "PFE", "name": "Pfizer Inc"},
+            {"id": "ABBV", "name": "AbbVie Inc"},
+            {"id": "MRK", "name": "Merck & Co Inc"},
+            {"id": "TMO", "name": "Thermo Fisher Scientific Inc"},
+            {"id": "ABT", "name": "Abbott Laboratories"},
+            {"id": "DHR", "name": "Danaher Corporation"},
         ]
     },
     {
-        "name": "Volatility & Hedging",
-        "description": "Volatility products and hedging instruments. Essential for risk management and tail risk protection.",
+        "name": "Energy Stocks & Commodities",
+        "description": "Energy companies (individual stocks) and commodity ETFs. Inflation hedge and commodity exposure.",
         "assets": [
-            {"id": "VXX", "name": "iPath Series B S&P 500 VIX Short-Term Futures ETN"},
-            {"id": "UVXY", "name": "ProShares Ultra VIX Short-Term Futures ETF"},
-            {"id": "VIXY", "name": "ProShares VIX Short-Term Futures ETF"},
-            {"id": "SVXY", "name": "ProShares Short VIX Short-Term Futures ETF"},
-            {"id": "SPY", "name": "SPDR S&P 500 ETF"},
-            {"id": "TLT", "name": "iShares 20+ Year Treasury Bond ETF"},
-            {"id": "GLD", "name": "SPDR Gold Trust"},
-        ]
-    },
-    {
-        "name": "Energy & Commodities",
-        "description": "Energy companies and commodity ETFs. Inflation hedge and commodity exposure with options availability.",
-        "assets": [
-            {"id": "XLE", "name": "Energy Select Sector SPDR"},
             {"id": "XOM", "name": "Exxon Mobil Corporation"},
             {"id": "CVX", "name": "Chevron Corporation"},
             {"id": "COP", "name": "ConocoPhillips"},
+            {"id": "SLB", "name": "Schlumberger Limited"},
             {"id": "GLD", "name": "SPDR Gold Trust"},
             {"id": "SLV", "name": "iShares Silver Trust"},
             {"id": "USO", "name": "United States Oil Fund"},
             {"id": "UNG", "name": "United States Natural Gas Fund"},
-            {"id": "DBA", "name": "Invesco DB Agriculture Fund"},
         ]
     },
     {
-        "name": "Fixed Income & Treasuries",
+        "name": "Fixed Income & Treasury ETFs",
         "description": "Treasury and bond ETFs across duration spectrum. Used for fixed income allocation and rates trading.",
         "assets": [
             {"id": "TLT", "name": "iShares 20+ Year Treasury Bond ETF"},
@@ -128,45 +114,59 @@ TARGET_SETS = [
         ]
     },
     {
-        "name": "International & Emerging",
-        "description": "International developed and emerging market exposure. Geographic diversification with options on key markets.",
+        "name": "Consumer & Retail Stocks",
+        "description": "Major consumer discretionary and retail companies (individual stocks). Economic cycle sensitive.",
         "assets": [
-            {"id": "EFA", "name": "iShares MSCI EAFE ETF"},
+            {"id": "WMT", "name": "Walmart Inc"},
+            {"id": "HD", "name": "The Home Depot Inc"},
+            {"id": "MCD", "name": "McDonald's Corporation"},
+            {"id": "NKE", "name": "Nike Inc"},
+            {"id": "SBUX", "name": "Starbucks Corporation"},
+            {"id": "TGT", "name": "Target Corporation"},
+            {"id": "LOW", "name": "Lowe's Companies Inc"},
+            {"id": "COST", "name": "Costco Wholesale Corporation"},
+        ]
+    },
+    {
+        "name": "Real Estate REITs",
+        "description": "Real Estate Investment Trusts (individual REITs) and real estate ETFs. Income-focused with real estate exposure.",
+        "assets": [
+            {"id": "AMT", "name": "American Tower Corporation"},
+            {"id": "PLD", "name": "Prologis Inc"},
+            {"id": "EQIX", "name": "Equinix Inc"},
+            {"id": "PSA", "name": "Public Storage"},
+            {"id": "WELL", "name": "Welltower Inc"},
+            {"id": "IYR", "name": "iShares U.S. Real Estate ETF"},
+            {"id": "VNQ", "name": "Vanguard Real Estate ETF"},
+            {"id": "SCHH", "name": "Schwab U.S. REIT ETF"},
+        ]
+    },
+    {
+        "name": "Industrial & Materials Stocks",
+        "description": "Industrial and materials companies (individual stocks). Economic growth indicators and infrastructure plays.",
+        "assets": [
+            {"id": "BA", "name": "The Boeing Company"},
+            {"id": "CAT", "name": "Caterpillar Inc"},
+            {"id": "GE", "name": "General Electric Company"},
+            {"id": "HON", "name": "Honeywell International Inc"},
+            {"id": "LIN", "name": "Linde plc"},
+            {"id": "APD", "name": "Air Products and Chemicals Inc"},
+            {"id": "ECL", "name": "Ecolab Inc"},
+            {"id": "EMR", "name": "Emerson Electric Co"},
+        ]
+    },
+    {
+        "name": "International Stocks & ETFs",
+        "description": "International developed and emerging market stocks and ETFs. Geographic diversification.",
+        "assets": [
+            {"id": "ASML", "name": "ASML Holding NV"},
+            {"id": "TSM", "name": "Taiwan Semiconductor Manufacturing"},
+            {"id": "NVO", "name": "Novo Nordisk A/S"},
+            {"id": "SAP", "name": "SAP SE"},
             {"id": "EEM", "name": "iShares MSCI Emerging Markets ETF"},
-            {"id": "FXI", "name": "iShares China Large-Cap ETF"},
             {"id": "EWJ", "name": "iShares MSCI Japan ETF"},
             {"id": "EWZ", "name": "iShares MSCI Brazil ETF"},
-            {"id": "EWG", "name": "iShares MSCI Germany ETF"},
-            {"id": "EWU", "name": "iShares MSCI United Kingdom ETF"},
-            {"id": "VWO", "name": "Vanguard FTSE Emerging Markets ETF"},
-        ]
-    },
-    {
-        "name": "Growth vs Value Factors",
-        "description": "Factor-based ETFs covering growth, value, momentum, quality, and low volatility strategies.",
-        "assets": [
-            {"id": "VUG", "name": "Vanguard Growth ETF"},
-            {"id": "VTV", "name": "Vanguard Value ETF"},
-            {"id": "IWF", "name": "iShares Russell 1000 Growth ETF"},
-            {"id": "IWD", "name": "iShares Russell 1000 Value ETF"},
-            {"id": "MTUM", "name": "iShares MSCI USA Momentum Factor ETF"},
-            {"id": "QUAL", "name": "iShares MSCI USA Quality Factor ETF"},
-            {"id": "USMV", "name": "iShares MSCI USA Min Vol Factor ETF"},
-            {"id": "SIZE", "name": "iShares MSCI USA Size Factor ETF"},
-        ]
-    },
-    {
-        "name": "Thematic & Alternatives",
-        "description": "Thematic and alternative investment strategies. Innovation, sector-specific themes, and specialty exposures.",
-        "assets": [
-            {"id": "ARKK", "name": "ARK Innovation ETF"},
-            {"id": "XBI", "name": "SPDR S&P Biotech ETF"},
-            {"id": "ICLN", "name": "iShares Global Clean Energy ETF"},
-            {"id": "SOXX", "name": "iShares Semiconductor ETF"},
-            {"id": "XRT", "name": "SPDR S&P Retail ETF"},
-            {"id": "IYR", "name": "iShares U.S. Real Estate ETF"},
-            {"id": "REM", "name": "iShares Mortgage Real Estate ETF"},
-            {"id": "GDX", "name": "VanEck Gold Miners ETF"},
+            {"id": "FXI", "name": "iShares China Large-Cap ETF"},
         ]
     },
 ]
