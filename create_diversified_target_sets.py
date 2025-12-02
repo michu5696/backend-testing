@@ -27,146 +27,193 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# Define the 10 target sets with their assets
-# Mix of individual stocks, ETFs, bonds, commodities, and REITs
+# Define diversified target sets with mixed asset types AND sectors
+# Each set contains a mix of stocks (across sectors), ETFs, bonds, commodities, and REITs
+# This enables portfolio optimization across both asset types and sectors
 # All assets verified to be available on Yahoo Finance
 TARGET_SETS = [
     {
-        "name": "US Mega Cap Tech Stocks",
-        "description": "Large-cap technology companies (individual stocks). Highly liquid with active options markets. Ideal for tech exposure and options strategies.",
+        "name": "Diversified Growth Portfolio",
+        "description": "Mixed asset types and sectors: tech, healthcare, consumer stocks; growth ETFs; commodities. Enables optimization across sectors and asset classes.",
         "assets": [
-            {"id": "AAPL", "name": "Apple Inc"},
-            {"id": "MSFT", "name": "Microsoft Corporation"},
-            {"id": "GOOGL", "name": "Alphabet Inc"},
-            {"id": "AMZN", "name": "Amazon.com Inc"},
-            {"id": "META", "name": "Meta Platforms Inc"},
-            {"id": "NVDA", "name": "NVIDIA Corporation"},
-            {"id": "TSLA", "name": "Tesla Inc"},
-            {"id": "NFLX", "name": "Netflix Inc"},
-        ]
-    },
-    {
-        "name": "Major Index ETFs",
-        "description": "Highly liquid index ETFs with the most active options markets globally. Perfect for market exposure and hedging.",
-        "assets": [
-            {"id": "SPY", "name": "SPDR S&P 500 ETF"},
+            # Stocks across sectors
+            {"id": "AAPL", "name": "Apple Inc"},  # Tech
+            {"id": "UNH", "name": "UnitedHealth Group Inc"},  # Healthcare
+            {"id": "NKE", "name": "Nike Inc"},  # Consumer
+            # Growth ETFs
             {"id": "QQQ", "name": "Invesco QQQ Trust"},
-            {"id": "IWM", "name": "iShares Russell 2000 ETF"},
-            {"id": "DIA", "name": "SPDR Dow Jones Industrial Average ETF"},
+            {"id": "VUG", "name": "Vanguard Growth ETF"},
+            # Commodities
+            {"id": "GLD", "name": "SPDR Gold Trust"},
+            {"id": "USO", "name": "United States Oil Fund"},
+        ]
+    },
+    {
+        "name": "Balanced Multi-Asset Portfolio",
+        "description": "Diversified mix across sectors (tech, financials, healthcare, consumer, energy) and asset types (stocks, ETFs, bonds). Enables full cross-asset and cross-sector optimization.",
+        "assets": [
+            # Broad Market ETFs
+            {"id": "SPY", "name": "SPDR S&P 500 ETF"},
             {"id": "VTI", "name": "Vanguard Total Stock Market ETF"},
+            # Individual Stocks across sectors
+            {"id": "MSFT", "name": "Microsoft Corporation"},  # Tech
+            {"id": "JPM", "name": "JPMorgan Chase & Co"},  # Financials
+            {"id": "JNJ", "name": "Johnson & Johnson"},  # Healthcare
+            {"id": "WMT", "name": "Walmart Inc"},  # Consumer
+            {"id": "XOM", "name": "Exxon Mobil Corporation"},  # Energy
+            # Fixed Income ETFs
+            {"id": "TLT", "name": "iShares 20+ Year Treasury Bond ETF"},
+            {"id": "AGG", "name": "iShares Core U.S. Aggregate Bond ETF"},
+        ]
+    },
+    {
+        "name": "Income & Value Portfolio",
+        "description": "Mix across sectors (financials, energy, consumer, real estate) and asset types (stocks, ETFs, REITs, bonds). Enables optimization across income-generating sectors and asset classes.",
+        "assets": [
+            # Value Stocks across sectors
+            {"id": "JPM", "name": "JPMorgan Chase & Co"},  # Financials
+            {"id": "XOM", "name": "Exxon Mobil Corporation"},  # Energy
+            {"id": "WMT", "name": "Walmart Inc"},  # Consumer
+            {"id": "JNJ", "name": "Johnson & Johnson"},  # Healthcare
+            # Value ETFs
+            {"id": "VTV", "name": "Vanguard Value ETF"},
+            # REITs
+            {"id": "AMT", "name": "American Tower Corporation"},
+            {"id": "VNQ", "name": "Vanguard Real Estate ETF"},
+            # Bonds
+            {"id": "IEF", "name": "iShares 7-10 Year Treasury Bond ETF"},
+            {"id": "LQD", "name": "iShares iBoxx $ Investment Grade Corporate Bond ETF"},
+        ]
+    },
+    {
+        "name": "Defensive Multi-Asset Portfolio",
+        "description": "Mix across defensive sectors (healthcare, consumer staples, utilities) and asset types (stocks, bonds, commodities). Enables optimization across defensive sectors and asset classes.",
+        "assets": [
+            # Defensive Stocks across sectors
+            {"id": "JNJ", "name": "Johnson & Johnson"},  # Healthcare
+            {"id": "PG", "name": "Procter & Gamble Co"},  # Consumer Staples
+            {"id": "KO", "name": "The Coca-Cola Company"},  # Consumer Staples
+            {"id": "UNH", "name": "UnitedHealth Group Inc"},  # Healthcare
+            # Bonds
+            {"id": "SHY", "name": "iShares 1-3 Year Treasury Bond ETF"},
+            {"id": "TIP", "name": "iShares TIPS Bond ETF"},
+            # Commodities
+            {"id": "GLD", "name": "SPDR Gold Trust"},
+            # Utilities ETF
+            {"id": "XLU", "name": "Utilities Select Sector SPDR"},
+        ]
+    },
+    {
+        "name": "International & Emerging Markets Portfolio",
+        "description": "Mix of international stocks (across sectors: tech, healthcare, industrial), emerging market ETFs, and commodities. Enables optimization across geographic regions, sectors, and asset types.",
+        "assets": [
+            # International Stocks across sectors
+            {"id": "ASML", "name": "ASML Holding NV"},  # Tech
+            {"id": "TSM", "name": "Taiwan Semiconductor Manufacturing"},  # Tech
+            {"id": "NVO", "name": "Novo Nordisk A/S"},  # Healthcare
+            {"id": "SAP", "name": "SAP SE"},  # Tech
+            # International ETFs
             {"id": "EFA", "name": "iShares MSCI EAFE ETF"},
+            {"id": "EEM", "name": "iShares MSCI Emerging Markets ETF"},
+            {"id": "EWJ", "name": "iShares MSCI Japan ETF"},
+            # Commodities (global exposure)
+            {"id": "GLD", "name": "SPDR Gold Trust"},
         ]
     },
     {
-        "name": "US Financial Stocks",
-        "description": "Major financial institutions and payment networks (individual stocks). Interest rate sensitive with active options trading.",
+        "name": "Sector Rotation Portfolio",
+        "description": "Mix of sector ETFs, individual stocks across sectors (financials, energy, tech, healthcare, consumer, industrial), and broad market. Enables optimization across sectors and market capitalization.",
         "assets": [
-            {"id": "JPM", "name": "JPMorgan Chase & Co"},
-            {"id": "BAC", "name": "Bank of America Corp"},
-            {"id": "GS", "name": "Goldman Sachs Group Inc"},
-            {"id": "WFC", "name": "Wells Fargo & Company"},
-            {"id": "C", "name": "Citigroup Inc"},
-            {"id": "MS", "name": "Morgan Stanley"},
-            {"id": "V", "name": "Visa Inc"},
-            {"id": "MA", "name": "Mastercard Inc"},
+            # Sector ETFs
+            {"id": "XLF", "name": "Financial Select Sector SPDR"},
+            {"id": "XLE", "name": "Energy Select Sector SPDR"},
+            {"id": "XLK", "name": "Technology Select Sector SPDR"},
+            {"id": "XLV", "name": "Health Care Select Sector SPDR"},
+            # Individual Stocks across sectors
+            {"id": "JPM", "name": "JPMorgan Chase & Co"},  # Financials
+            {"id": "XOM", "name": "Exxon Mobil Corporation"},  # Energy
+            {"id": "AAPL", "name": "Apple Inc"},  # Tech
+            {"id": "JNJ", "name": "Johnson & Johnson"},  # Healthcare
+            {"id": "HD", "name": "The Home Depot Inc"},  # Consumer
+            {"id": "CAT", "name": "Caterpillar Inc"},  # Industrial
+            # Broad Market
+            {"id": "SPY", "name": "SPDR S&P 500 ETF"},
         ]
     },
     {
-        "name": "Healthcare & Pharma Stocks",
-        "description": "Major healthcare and pharmaceutical companies (individual stocks). Defensive sector with growth potential.",
+        "name": "Alternative & Commodity Portfolio",
+        "description": "Mix of commodities, REITs (across subsectors), and alternative assets. Enables optimization across real assets and alternative investment types.",
         "assets": [
-            {"id": "JNJ", "name": "Johnson & Johnson"},
-            {"id": "UNH", "name": "UnitedHealth Group Inc"},
-            {"id": "PFE", "name": "Pfizer Inc"},
-            {"id": "ABBV", "name": "AbbVie Inc"},
-            {"id": "MRK", "name": "Merck & Co Inc"},
-            {"id": "TMO", "name": "Thermo Fisher Scientific Inc"},
-            {"id": "ABT", "name": "Abbott Laboratories"},
-            {"id": "DHR", "name": "Danaher Corporation"},
-        ]
-    },
-    {
-        "name": "Energy Stocks & Commodities",
-        "description": "Energy companies (individual stocks) and commodity ETFs. Inflation hedge and commodity exposure.",
-        "assets": [
-            {"id": "XOM", "name": "Exxon Mobil Corporation"},
-            {"id": "CVX", "name": "Chevron Corporation"},
-            {"id": "COP", "name": "ConocoPhillips"},
-            {"id": "SLB", "name": "Schlumberger Limited"},
+            # Commodities
             {"id": "GLD", "name": "SPDR Gold Trust"},
             {"id": "SLV", "name": "iShares Silver Trust"},
             {"id": "USO", "name": "United States Oil Fund"},
             {"id": "UNG", "name": "United States Natural Gas Fund"},
+            # REITs (different subsectors)
+            {"id": "AMT", "name": "American Tower Corporation"},  # Infrastructure
+            {"id": "PLD", "name": "Prologis Inc"},  # Industrial
+            {"id": "EQIX", "name": "Equinix Inc"},  # Data Centers
+            {"id": "IYR", "name": "iShares U.S. Real Estate ETF"},
         ]
     },
     {
-        "name": "Fixed Income & Treasury ETFs",
-        "description": "Treasury and bond ETFs across duration spectrum. Used for fixed income allocation and rates trading.",
+        "name": "Fixed Income & Credit Portfolio",
+        "description": "Mix of Treasury bonds, corporate bonds, and credit-sensitive stocks across sectors (financials, industrials). Enables optimization across duration, credit quality, and sectors.",
         "assets": [
+            # Treasury ETFs (different durations)
             {"id": "TLT", "name": "iShares 20+ Year Treasury Bond ETF"},
             {"id": "IEF", "name": "iShares 7-10 Year Treasury Bond ETF"},
             {"id": "SHY", "name": "iShares 1-3 Year Treasury Bond ETF"},
-            {"id": "AGG", "name": "iShares Core U.S. Aggregate Bond ETF"},
+            # Corporate Bonds
             {"id": "LQD", "name": "iShares iBoxx $ Investment Grade Corporate Bond ETF"},
             {"id": "HYG", "name": "iShares iBoxx $ High Yield Corporate Bond ETF"},
-            {"id": "TIP", "name": "iShares TIPS Bond ETF"},
-            {"id": "MUB", "name": "iShares National Muni Bond ETF"},
+            # Credit-sensitive stocks across sectors
+            {"id": "JPM", "name": "JPMorgan Chase & Co"},  # Financials
+            {"id": "BAC", "name": "Bank of America Corp"},  # Financials
+            {"id": "GE", "name": "General Electric Company"},  # Industrials
         ]
     },
     {
-        "name": "Consumer & Retail Stocks",
-        "description": "Major consumer discretionary and retail companies (individual stocks). Economic cycle sensitive.",
+        "name": "Growth & Innovation Portfolio",
+        "description": "Mix of growth stocks across sectors (tech, healthcare, consumer), growth ETFs, and innovation themes. Enables optimization across growth-oriented sectors and asset types.",
         "assets": [
-            {"id": "WMT", "name": "Walmart Inc"},
-            {"id": "HD", "name": "The Home Depot Inc"},
-            {"id": "MCD", "name": "McDonald's Corporation"},
-            {"id": "NKE", "name": "Nike Inc"},
-            {"id": "SBUX", "name": "Starbucks Corporation"},
-            {"id": "TGT", "name": "Target Corporation"},
-            {"id": "LOW", "name": "Lowe's Companies Inc"},
-            {"id": "COST", "name": "Costco Wholesale Corporation"},
+            # Growth Stocks across sectors
+            {"id": "AAPL", "name": "Apple Inc"},  # Tech
+            {"id": "MSFT", "name": "Microsoft Corporation"},  # Tech
+            {"id": "GOOGL", "name": "Alphabet Inc"},  # Tech
+            {"id": "AMZN", "name": "Amazon.com Inc"},  # Tech/Consumer
+            {"id": "UNH", "name": "UnitedHealth Group Inc"},  # Healthcare
+            {"id": "NKE", "name": "Nike Inc"},  # Consumer
+            # Growth ETFs
+            {"id": "QQQ", "name": "Invesco QQQ Trust"},
+            {"id": "ARKK", "name": "ARK Innovation ETF"},
+            # Thematic ETFs
+            {"id": "SOXX", "name": "iShares Semiconductor ETF"},
         ]
     },
     {
-        "name": "Real Estate REITs",
-        "description": "Real Estate Investment Trusts (individual REITs) and real estate ETFs. Income-focused with real estate exposure.",
+        "name": "Comprehensive Multi-Asset Portfolio",
+        "description": "Maximum diversification across all asset types (stocks, ETFs, bonds, commodities, REITs, international) and sectors (tech, financials, healthcare, consumer, energy, industrial). Enables full portfolio optimization across all dimensions.",
         "assets": [
-            {"id": "AMT", "name": "American Tower Corporation"},
-            {"id": "PLD", "name": "Prologis Inc"},
-            {"id": "EQIX", "name": "Equinix Inc"},
-            {"id": "PSA", "name": "Public Storage"},
-            {"id": "WELL", "name": "Welltower Inc"},
-            {"id": "IYR", "name": "iShares U.S. Real Estate ETF"},
+            # Broad Market ETFs
+            {"id": "SPY", "name": "SPDR S&P 500 ETF"},
+            {"id": "VTI", "name": "Vanguard Total Stock Market ETF"},
+            # Individual Stocks across sectors
+            {"id": "AAPL", "name": "Apple Inc"},  # Tech
+            {"id": "JPM", "name": "JPMorgan Chase & Co"},  # Financials
+            {"id": "JNJ", "name": "Johnson & Johnson"},  # Healthcare
+            {"id": "WMT", "name": "Walmart Inc"},  # Consumer
+            {"id": "XOM", "name": "Exxon Mobil Corporation"},  # Energy
+            {"id": "CAT", "name": "Caterpillar Inc"},  # Industrial
+            # Fixed Income
+            {"id": "TLT", "name": "iShares 20+ Year Treasury Bond ETF"},
+            {"id": "AGG", "name": "iShares Core U.S. Aggregate Bond ETF"},
+            # Commodities
+            {"id": "GLD", "name": "SPDR Gold Trust"},
+            # REITs
             {"id": "VNQ", "name": "Vanguard Real Estate ETF"},
-            {"id": "SCHH", "name": "Schwab U.S. REIT ETF"},
-        ]
-    },
-    {
-        "name": "Industrial & Materials Stocks",
-        "description": "Industrial and materials companies (individual stocks). Economic growth indicators and infrastructure plays.",
-        "assets": [
-            {"id": "BA", "name": "The Boeing Company"},
-            {"id": "CAT", "name": "Caterpillar Inc"},
-            {"id": "GE", "name": "General Electric Company"},
-            {"id": "HON", "name": "Honeywell International Inc"},
-            {"id": "LIN", "name": "Linde plc"},
-            {"id": "APD", "name": "Air Products and Chemicals Inc"},
-            {"id": "ECL", "name": "Ecolab Inc"},
-            {"id": "EMR", "name": "Emerson Electric Co"},
-        ]
-    },
-    {
-        "name": "International Stocks & ETFs",
-        "description": "International developed and emerging market stocks and ETFs. Geographic diversification.",
-        "assets": [
-            {"id": "ASML", "name": "ASML Holding NV"},
-            {"id": "TSM", "name": "Taiwan Semiconductor Manufacturing"},
-            {"id": "NVO", "name": "Novo Nordisk A/S"},
-            {"id": "SAP", "name": "SAP SE"},
-            {"id": "EEM", "name": "iShares MSCI Emerging Markets ETF"},
-            {"id": "EWJ", "name": "iShares MSCI Japan ETF"},
-            {"id": "EWZ", "name": "iShares MSCI Brazil ETF"},
-            {"id": "FXI", "name": "iShares China Large-Cap ETF"},
+            # International
+            {"id": "EFA", "name": "iShares MSCI EAFE ETF"},
         ]
     },
 ]
@@ -220,7 +267,7 @@ async def get_or_create_template_project(db: CloudSQLManager) -> str:
         """,
             db._to_uuid(admin_id),
             "main project",
-            "Main project containing pre-configured target sets and conditioning sets for portfolio management and options trading",
+            "Main project containing pre-configured target sets for portfolio management and options trading",
             True,
             date(2020, 1, 1),  # Default training window
             date(2024, 12, 31)
