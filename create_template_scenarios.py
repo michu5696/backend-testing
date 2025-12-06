@@ -11,6 +11,8 @@ Creates 3 template scenarios per model:
 import asyncio
 import sys
 import os
+import json
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
@@ -59,53 +61,90 @@ SCENARIO_TEMPLATES_BY_MODEL = {
     "Balanced Portfolio - Core Macro Indicators": [
         {
             "name_suffix": "Economic Expansion - 2019",
-            "description": "Simulates pre-COVID economic expansion period. Past windows use recent data. Future conditioning for 'Core Macroeconomic Indicators' uses 2019-05-15 to test balanced portfolio resilience in stable growth.",
+            "description": "Simulates pre-COVID economic expansion period with stable growth conditions.",
             "simulation_date": None,
             "feature_simulation_dates": {
                 "Core Macroeconomic Indicators": "2019-05-15"
             },
+            "portfolio_impact_theme": "Stable Growth",
+            "assets_affected": [
+                {"name": "Stocks", "direction": "up"},
+                {"name": "Bonds", "direction": "flat"}
+            ],
+            "tags": ["expansion", "macro", "2019"]
         },
         {
             "name_suffix": "Post-COVID Recovery - 2021",
-            "description": "Simulates post-COVID recovery with economic normalization. Past windows use recent data. Future conditioning for 'Core Macroeconomic Indicators' uses 2021-06-15 to test balanced portfolio performance during recovery.",
+            "description": "Simulates post-COVID recovery with economic normalization.",
             "simulation_date": None,
             "feature_simulation_dates": {
                 "Core Macroeconomic Indicators": "2021-06-15"
             },
+            "portfolio_impact_theme": "Recovery",
+            "assets_affected": [
+                {"name": "Stocks", "direction": "up"},
+                {"name": "Bonds", "direction": "down"}
+            ],
+            "tags": ["recovery", "macro", "2021"]
         },
         {
             "name_suffix": "Moderate Growth - 2016",
-            "description": "Simulates moderate economic growth period. Past windows use recent data. Future conditioning for 'Core Macroeconomic Indicators' uses 2016-08-15 to test balanced portfolio in steady expansion.",
+            "description": "Simulates moderate economic growth period with steady expansion.",
             "simulation_date": None,
             "feature_simulation_dates": {
                 "Core Macroeconomic Indicators": "2016-08-15"
             },
+            "portfolio_impact_theme": "Steady Growth",
+            "assets_affected": [
+                {"name": "Stocks", "direction": "up"},
+                {"name": "Bonds", "direction": "flat"}
+            ],
+            "tags": ["growth", "macro", "2016"]
         },
     ],
     "Balanced Portfolio - Interest Rates & Yield Curve": [
         {
             "name_suffix": "Rising Rates Stress - 2022",
-            "description": "Stress test with aggressive Fed rate hikes. Past windows use recent data. Future conditioning for 'Interest Rates & Yield Curve' uses 2022-06-15 to test balanced portfolio resilience to rising rates.",
+            "description": "Stress test with aggressive Fed rate hikes.",
             "simulation_date": None,
             "feature_simulation_dates": {
                 "Interest Rates & Yield Curve": "2022-06-15"
             },
+            "portfolio_impact_theme": "Rising Rates",
+            "assets_affected": [
+                {"name": "Bonds", "direction": "down"},
+                {"name": "REITs", "direction": "down"},
+                {"name": "Tech", "direction": "down"}
+            ],
+            "tags": ["stress-test", "rates", "fed-hikes", "2022"]
         },
         {
             "name_suffix": "Stable Rates Environment - 2018",
-            "description": "Simulates stable rates environment with moderate growth. Past windows use recent data. Future conditioning for 'Interest Rates & Yield Curve' uses 2018-05-15 to test balanced portfolio in stable rate conditions.",
+            "description": "Simulates stable rates environment with moderate growth.",
             "simulation_date": None,
             "feature_simulation_dates": {
                 "Interest Rates & Yield Curve": "2018-05-15"
             },
+            "portfolio_impact_theme": "Stable Rates",
+            "assets_affected": [
+                {"name": "Bonds", "direction": "flat"},
+                {"name": "Stocks", "direction": "up"}
+            ],
+            "tags": ["rates", "stable", "2018"]
         },
         {
             "name_suffix": "Low Rates Recovery - 2021",
-            "description": "Simulates low rates recovery period post-COVID. Past windows use recent data. Future conditioning for 'Interest Rates & Yield Curve' uses 2021-06-15 to test balanced portfolio in accommodative monetary policy.",
+            "description": "Simulates low rates recovery period post-COVID.",
             "simulation_date": None,
             "feature_simulation_dates": {
                 "Interest Rates & Yield Curve": "2021-06-15"
             },
+            "portfolio_impact_theme": "Low Rates",
+            "assets_affected": [
+                {"name": "Bonds", "direction": "down"},
+                {"name": "Stocks", "direction": "up"}
+            ],
+            "tags": ["rates", "recovery", "2021"]
         },
     ],
     "Balanced Portfolio - Core Macro Mix": [
@@ -401,6 +440,10 @@ async def create_or_update_template_scenario(
     scenario_description: str,
     simulation_date: Optional[str] = None,
     feature_simulation_dates: Optional[Dict[str, Any]] = None,
+    # New display fields
+    portfolio_impact_theme: Optional[str] = None,
+    assets_affected: Optional[List[Dict[str, str]]] = None,
+    tags: Optional[List[str]] = None,
 ) -> str:
     """Create or update a template scenario (updates if exists, creates if not)"""
     # Convert model_id to string if it's a UUID object
@@ -421,64 +464,76 @@ async def create_or_update_template_scenario(
         "simulation_date": simulation_date,
         "feature_simulation_dates": _serialize_for_json(feature_simulation_dates) if feature_simulation_dates else None,
         "is_template": True,
+        # New display fields
+        "portfolio_impact_theme": portfolio_impact_theme,
+        "assets_affected": _serialize_for_json(assets_affected) if assets_affected else None,
+        "tags": tags,
     }
     payload = _serialize_for_json(payload_data)
     
     if existing_scenario_id:
-        # Update existing scenario
+        # Update existing scenario using direct DB - bypasses API restrictions
         logger.info(f"📝 Updating existing template scenario: {scenario_name}")
-        url = f"{api_url}/api/v1/scenarios/{existing_scenario_id}"
-        
-        # UpdateScenarioRequest fields
-        update_payload = {
-            "name": scenario_name,
-            "description": scenario_description,
-            "simulation_date": simulation_date,
-            "feature_simulation_dates": payload["feature_simulation_dates"],
-        }
-        update_payload = _serialize_for_json(update_payload)
-        
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.patch(url, json=update_payload, headers=headers)
-                response.raise_for_status()
-                result = response.json()
-                scenario_id = result.get("id", existing_scenario_id)
-                logger.info(f"✅ Updated template scenario: {scenario_id}")
-                return scenario_id
-        except httpx.HTTPStatusError as e:
-            error_detail = e.response.json().get("detail", str(e)) if e.response.content else str(e)
-            logger.error(f"❌ Failed to update scenario '{scenario_name}': {error_detail}")
-            raise
-        except Exception as e:
-            logger.error(f"❌ Failed to update scenario '{scenario_name}': {e}")
-            raise
+        async with db.connection() as conn:
+            await conn.execute("""
+                UPDATE scenarios 
+                SET description = $1,
+                    simulation_date = $2,
+                    feature_simulation_dates = $3,
+                    portfolio_impact_theme = $4,
+                    assets_affected = $5,
+                    tags = $6,
+                    status = 'configured',
+                    updated_at = NOW()
+                WHERE id = $7
+            """,
+                scenario_description,
+                datetime.strptime(simulation_date, '%Y-%m-%d').date() if simulation_date else None,
+                json.dumps(feature_simulation_dates) if feature_simulation_dates else None,
+                portfolio_impact_theme,
+                json.dumps(assets_affected) if assets_affected else None,
+                json.dumps(tags) if tags else None,
+                db._to_uuid(existing_scenario_id)
+            )
+        logger.info(f"✅ Updated template scenario: {existing_scenario_id}")
+        return existing_scenario_id
     else:
-        # Create new scenario
+        # Create new scenario using direct DB
         logger.info(f"Creating template scenario: {scenario_name}")
-        url = f"{api_url}/api/v1/scenarios"
-        
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.post(url, json=payload, headers=headers)
-                response.raise_for_status()
-                result = response.json()
-                scenario_id = result.get("id")
-                logger.info(f"✅ Created template scenario: {scenario_id}")
-                return scenario_id
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 400:
-                error_detail = e.response.json().get("detail", str(e)) if e.response.content else str(e)
-                logger.error(f"❌ Failed to create scenario '{scenario_name}': {error_detail}")
-                # Check if it's because model is not shared
-                if "shared" in error_detail.lower() or "template" in error_detail.lower():
-                    logger.warning(f"⚠️  Model may not be shared. Template scenarios require shared models.")
-            else:
-                logger.error(f"❌ Failed to create scenario '{scenario_name}': {e}")
-            raise
-        except Exception as e:
-            logger.error(f"❌ Failed to create scenario '{scenario_name}': {e}")
-            raise
+        async with db.connection() as conn:
+            # Get model's owner for user_id
+            model_row = await conn.fetchrow("""
+                SELECT user_id, target_set_id, conditioning_set_id 
+                FROM models WHERE id = $1
+            """, db._to_uuid(model_id_str))
+            
+            if not model_row:
+                raise Exception(f"Model {model_id_str} not found")
+            
+            user_id = model_row['user_id']
+            target_set_id = model_row['target_set_id']
+            conditioning_set_id = model_row['conditioning_set_id']
+            
+            row = await conn.fetchrow("""
+                INSERT INTO scenarios (
+                    user_id, model_id, target_set_id, conditioning_set_id, name, description, 
+                    simulation_date, feature_simulation_dates, status, is_template, chat_history,
+                    portfolio_impact_theme, assets_affected, tags
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'configured', TRUE, '[]'::jsonb, $9, $10, $11)
+                RETURNING id
+            """, 
+                user_id, db._to_uuid(model_id_str), target_set_id, conditioning_set_id,
+                scenario_name, scenario_description,
+                datetime.strptime(simulation_date, '%Y-%m-%d').date() if simulation_date else None,
+                json.dumps(feature_simulation_dates) if feature_simulation_dates else None,
+                portfolio_impact_theme,
+                json.dumps(assets_affected) if assets_affected else None,
+                json.dumps(tags) if tags else None
+            )
+            scenario_id = str(row['id'])
+            logger.info(f"✅ Created template scenario: {scenario_id}")
+            return scenario_id
 
 
 async def check_model_is_shared(db: CloudSQLManager, model_id: str) -> bool:
@@ -608,6 +663,10 @@ async def main():
                         template['description'],
                         template.get('simulation_date'),
                         template.get('feature_simulation_dates'),
+                        # New display fields
+                        template.get('portfolio_impact_theme'),
+                        template.get('assets_affected'),
+                        template.get('tags'),
                     )
                     
                     created_scenarios.append({

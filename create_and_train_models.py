@@ -241,6 +241,8 @@ async def submit_training_job(
     training_end_date: str = "2025-09-30",
     n_regimes: int = 3,
     stride: int = 2,
+    feature_grouping_threshold: float = 1.0,
+    encoding_quality_weight: float = 100.0,
 ) -> str:
     """
     Submit a training job via API.
@@ -248,6 +250,10 @@ async def submit_training_job(
     Note: FRED API key will be automatically retrieved from the user's stored API keys.
     The system will use the user_id extracted from the API key authentication to fetch
     the stored FRED API key during data fetching.
+    
+    Args:
+        feature_grouping_threshold: Correlation threshold for feature grouping (1.0 = no grouping, lower = enable grouping)
+        encoding_quality_weight: Weight for reconstruction quality vs encoding components (higher = prioritize quality)
     """
     url = f"{api_url}/api/v1/ml/train"
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -256,6 +262,8 @@ async def submit_training_job(
         "model_id": model_id,
         "n_regimes": n_regimes,
         "compute_validation_ll": False,
+        "feature_grouping_threshold": feature_grouping_threshold,
+        "encoding_quality_weight": encoding_quality_weight,
         "data_fetch": {
             "start_date": training_start_date,
             "end_date": training_end_date,
@@ -404,6 +412,9 @@ async def main():
         logger.info("   Using windows: pastWindow=100, futureWindow=80")
         logger.info("   ⚠️  SEQUENTIAL MODE: Each job will complete before starting the next")
         logger.info("   This avoids connection pool exhaustion and FRED API rate limits")
+        logger.info("   🔧 ICA DISABLED: Using PCA only for better reconstruction quality")
+        logger.info("   🎯 Encoding quality weight: 100.0 (prioritizing R²)")
+        logger.info("   📊 Feature grouping: Enabled (0.7) for yield/rate models, Disabled (1.0) for others")
         
         processed_models = []
         completed_jobs = []
@@ -489,6 +500,23 @@ async def main():
                     logger.info(f"  🔄 Proceeding with training job submission...")
                     # Continue anyway
                 
+                # Determine feature grouping threshold based on model type
+                # Enable feature grouping for yield/rate models (lower threshold)
+                # Disable for others (threshold = 1.0)
+                conditioning_name = config['conditioning_set_name'].lower()
+                has_yields = 'yield' in conditioning_name or 'rate' in conditioning_name or 'interest' in conditioning_name
+                
+                if has_yields:
+                    feature_grouping_threshold = 0.7  # Enable grouping for yield/rate models
+                    logger.info(f"  📊 Feature grouping ENABLED (threshold=0.7) for yield/rate model")
+                else:
+                    feature_grouping_threshold = 1.0  # No grouping for other models
+                    logger.info(f"  📊 Feature grouping DISABLED (threshold=1.0)")
+                
+                # Higher encoding quality weight to push for better R²
+                encoding_quality_weight = 100.0  # Increased from default 50.0 to prioritize reconstruction quality
+                logger.info(f"  🎯 Encoding quality weight: {encoding_quality_weight} (prioritizing R²)")
+                
                 # Submit training job
                 logger.info(f"\n📤 Submitting training job...")
                 job_id = await submit_training_job(
@@ -497,6 +525,8 @@ async def main():
                     model_id,
                     training_start_date="2015-01-01",
                     training_end_date="2025-09-30",
+                    feature_grouping_threshold=feature_grouping_threshold,
+                    encoding_quality_weight=encoding_quality_weight,
                 )
                 
                 # Wait for training to complete before moving to next job
