@@ -49,9 +49,11 @@ import numpy as np
 try:
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    import pandas as pd
 except ImportError:
     plt = None
     mdates = None
+    pd = None
 
 
 # =============================================================================
@@ -128,6 +130,118 @@ def print_error(message: str) -> None:
 def print_warning(message: str) -> None:
     """Print warning message."""
     print(f"⚠️  {message}")
+
+
+def _plot_forecast_paths(
+    forecast_result: Dict[str, Any],
+    feature_name: str,
+    output_path: Path,
+    n_paths_to_plot: int = 100,
+    scenario_name: str = "Unconditional",
+) -> None:
+    """
+    Plot forecast paths with confidence intervals over time and individual paths.
+    
+    Args:
+        forecast_result: Forecast API response with 'summary' and 'dates'
+        feature_name: Which feature to plot
+        output_path: Where to save the plot
+        n_paths_to_plot: Number of individual paths to plot
+        scenario_name: Name for the plot title
+    """
+    if plt is None or pd is None:
+        print_warning("matplotlib or pandas not available; skipping plot")
+        return
+    
+    summary = forecast_result.get('summary', [])
+    dates_raw = forecast_result.get('dates', [])
+    
+    if not summary or not dates_raw:
+        print_warning("No summary data or dates to plot")
+        return
+    
+    # Find data for the requested feature
+    feature_data = None
+    for item in summary:
+        if item.get('feature') == feature_name:
+            feature_data = item
+            break
+    
+    if not feature_data:
+        print_warning(f"Feature '{feature_name}' not found in summary")
+        return
+    
+    # Extract time-series statistics
+    mean_vals = feature_data.get('mean', [])
+    std_vals = feature_data.get('std', [])
+    q05 = feature_data.get('q05', [])
+    q25 = feature_data.get('q25', [])
+    q50 = feature_data.get('q50', [])
+    q75 = feature_data.get('q75', [])
+    q95 = feature_data.get('q95', [])
+    
+    if not mean_vals or not isinstance(mean_vals, list):
+        print_warning(f"No time-series mean values to plot (got {type(mean_vals)})")
+        return
+    
+    # Parse dates
+    try:
+        dates = pd.to_datetime(dates_raw)
+    except:
+        dates = np.arange(len(mean_vals))
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(14, 7))
+    
+    # Plot individual paths (if available)
+    paths_data = forecast_result.get('paths', {})
+    if paths_data and feature_name in paths_data:
+        paths_array = np.array(paths_data[feature_name])  # (n_paths, horizon)
+        n_to_plot = min(n_paths_to_plot, paths_array.shape[0])
+        for i in range(n_to_plot):
+            ax.plot(dates, paths_array[i], color='darkgray', alpha=0.15, linewidth=0.8, zorder=1)
+        print_step("plot", f"Plotted {n_to_plot} individual paths")
+    else:
+        print_warning(f"No paths data found. paths_data keys: {list(paths_data.keys()) if paths_data else 'None'}")
+    
+    # Plot confidence intervals
+    if q05 and q95 and len(q05) == len(dates):
+        ax.fill_between(dates, q05, q95, alpha=0.2, color='blue', label='5%-95%', zorder=2)
+    if q25 and q75 and len(q25) == len(dates):
+        ax.fill_between(dates, q25, q75, alpha=0.3, color='blue', label='25%-75%', zorder=2)
+    
+    # Plot median and mean
+    if q50 and len(q50) == len(dates):
+        ax.plot(dates, q50, 'b-', linewidth=2.5, label='Median', alpha=0.9, zorder=4)
+    if mean_vals and len(mean_vals) == len(dates):
+        ax.plot(dates, mean_vals, 'r--', linewidth=2.5, label='Mean', alpha=0.9, zorder=4)
+    
+    # Formatting
+    ax.set_title(f"{feature_name} - {scenario_name} Forecast", fontsize=14, fontweight='bold')
+    ax.set_xlabel('Date', fontsize=12)
+    ax.set_ylabel('Price', fontsize=12)
+    ax.legend(loc='best', fontsize=10, framealpha=0.95)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    
+    # Format x-axis if using dates
+    if isinstance(dates, pd.DatetimeIndex) and mdates is not None:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        ax.tick_params(axis='x', rotation=30)
+    
+    # Add stats box
+    final_mean = mean_vals[-1] if isinstance(mean_vals, list) else mean_vals
+    final_std = std_vals[-1] if isinstance(std_vals, list) else std_vals
+    stats_text = f"Final: {final_mean:.2f} ± {final_std:.2f}"
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print_step("plot", f"Saved forecast preview to {output_path}")
 
 
 # =============================================================================
@@ -412,13 +526,13 @@ class SSMPipelineClient:
         self,
         model_id: str,
         state_model: str = "gru",
-        generation_model: str = "flow",
+        generation_model: str = "gaussian",
         hidden_dim: Optional[int] = None,
         n_layers: int = 1,
         use_factors: bool = True,
         n_factors: Optional[int] = None,
         learning_rate: float = 1e-3,
-        max_epochs: int = 100,
+        max_epochs: int = 50,
         batch_size: int = 32,
         check_existing: bool = True,
     ) -> Dict[str, Any]:
@@ -510,6 +624,7 @@ class SSMPipelineClient:
         n_paths: int = 1000,
         feature_scenarios: Optional[Dict[str, Any]] = None,
         conditioning: Optional[Dict[str, List[float]]] = None,
+        include_paths: bool = True,
     ) -> Dict[str, Any]:
         """Run a forecast."""
         payload = {
@@ -517,6 +632,7 @@ class SSMPipelineClient:
             "scenario_name": scenario_name,
             "horizon": horizon,
             "n_paths": n_paths,
+            "include_paths": include_paths,
         }
         if feature_scenarios:
             payload["feature_scenarios"] = feature_scenarios
@@ -651,7 +767,7 @@ class SSMPipelineTest:
     def train_model(
         self,
         state_model: str = "gru",
-        generation_model: str = "flow",
+        generation_model: str = "gaussian",
         max_epochs: int = 50,
         poll_interval: int = 10,
         timeout: int = 0,
@@ -673,14 +789,23 @@ class SSMPipelineTest:
         )
         
         status = result.get("status")
+        message = result.get("message", "")
         print_step("train", f"Job submitted: status={status}")
+        
+        # Check for immediate failure (synchronous local training that failed)
+        if status == "failed":
+            print_error(f"Training failed immediately: {message}")
+            return "failed"
         
         # If training runs synchronously (local dev), it's already done
         if status == "trained":
             print_success("Training completed (synchronous)")
             return "trained"
         
-        # Poll for async training
+        # Poll for async training (status should be 'training' or 'pending')
+        if status not in ["training", "pending"]:
+            print_warning(f"Unexpected status after submission: {status}, will poll anyway")
+        
         print_step("train", "Polling for completion...")
         return self.client.poll_training(self.model_id, poll_interval, timeout)
     
@@ -709,11 +834,36 @@ class SSMPipelineTest:
         # Print summary
         summary = result.get("summary", [])
         if summary:
-            print_step("forecast", "Summary statistics:")
+            print_step("forecast", "Summary statistics (final timestep):")
             for stat in summary[:3]:  # First 3 features
-                print(f"    {stat['feature']}: mean={stat['mean']:.4f}, std={stat['std']:.4f}")
+                # Statistics are now time-series (list), get final value
+                mean_final = stat['mean'][-1] if isinstance(stat['mean'], list) else stat['mean']
+                std_final = stat['std'][-1] if isinstance(stat['std'], list) else stat['std']
+                print(f"    {stat['feature']}: mean={mean_final:.4f}, std={std_final:.4f}")
         
         print_success("Unconditional forecast completed")
+        
+        # Plot forecast (always try to plot if we have summary data)
+        if summary:
+            # Try to get target feature from summary (if target_set not loaded)
+            if self.target_set:
+                target_features = [f['name'] for f in self.target_set.get('features', [])]
+            else:
+                # Use first feature from summary if target_set not available
+                target_features = [summary[0]['feature']] if summary else []
+            
+            if target_features:
+                plot_path = Path(__file__).parent / "forecast_unconditional.png"
+                try:
+                    _plot_forecast_paths(result, target_features[0], plot_path, scenario_name="Unconditional")
+                    print_step("plot", f"Saved forecast plot to {plot_path}")
+                except Exception as e:
+                    print_warning(f"Failed to generate plot: {e}")
+            else:
+                print_warning("No target features available for plotting")
+        else:
+            print_warning("No summary data available for plotting")
+        
         return result
     
     def run_forecast_with_scenario(
@@ -752,6 +902,17 @@ class SSMPipelineTest:
         print_step("forecast", f"Scenario type: {result.get('scenario_type')}")
         print_step("forecast", f"Simulation ID: {result.get('simulation_id')}")
         
+        # Plot scenario forecast
+        if self.target_set and self.target_set.get('features'):
+            target_features = [f['name'] for f in self.target_set['features']]
+            if target_features:
+                plot_path = Path(__file__).parent / f"forecast_{scenario_name.lower().replace(' ', '_')}.png"
+                try:
+                    _plot_forecast_paths(result, target_features[0], plot_path, scenario_name=scenario_name)
+                    print_step("plot", f"Saved scenario plot to {plot_path}")
+                except Exception as e:
+                    print_warning(f"Failed to generate scenario plot: {e}")
+        
         print_success(f"Scenario forecast '{scenario_name}' completed")
         return result
     
@@ -759,7 +920,7 @@ class SSMPipelineTest:
         self,
         model_name: str,
         state_model: str = "gru",
-        generation_model: str = "flow",
+        generation_model: str = "gaussian",
         max_epochs: int = 50,
         poll_interval: int = 10,
         training_timeout: int = 0,
@@ -884,12 +1045,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--generation-model",
         choices=["gaussian", "flow", "copula"],
-        default="flow",
+        default="gaussian",
         help="Generation model type",
     )
     
     # Training settings
-    parser.add_argument("--max-epochs", type=int, default=50)
+    parser.add_argument("--max-epochs", type=int, default=10, help="Maximum training epochs (default: 50)")
     parser.add_argument("--poll-interval", type=int, default=10)
     parser.add_argument("--training-timeout", type=int, default=0, help="0 = no timeout")
     
@@ -979,8 +1140,22 @@ def main() -> None:
         if args.target_set_id:
             test.target_set = {"id": args.target_set_id}
         if args.model_id:
-            test.model = {"id": args.model_id}
             test.model_id = args.model_id
+            # Ensure model dict is also set (even if minimal)
+            if not test.model:
+                test.model = {"id": args.model_id}
+        
+        # Load full feature set details if IDs are known (needed for plotting)
+        if args.target_set_id and (not test.target_set or 'features' not in test.target_set):
+            try:
+                test.target_set = client._request("GET", f"/api/v1/feature-sets/{args.target_set_id}")
+            except Exception:
+                pass
+        if args.conditioning_set_id and (not test.conditioning_set or 'features' not in test.conditioning_set):
+            try:
+                test.conditioning_set = client._request("GET", f"/api/v1/feature-sets/{args.conditioning_set_id}")
+            except Exception:
+                pass
         
         if args.stage == "all":
             # Full pipeline
@@ -1048,9 +1223,24 @@ def main() -> None:
                         test.create_model(args.model_name)
                 
                 elif stage == "training":
-                    if not test.model:
-                        print_error("Need model for training. Provide --model-id or run earlier stages.")
-                        sys.exit(1)
+                    # Check both model dict and model_id
+                    if not test.model_id:
+                        if test.model and test.model.get('id'):
+                            test.model_id = test.model['id']
+                        else:
+                            print_error("Need model for training. Provide --model-id or run earlier stages.")
+                            print("  Tip: Use --project-id to auto-discover the most recent model")
+                            sys.exit(1)
+                    
+                    # Ensure model dict is set if we only have model_id
+                    if not test.model or not test.model.get('id'):
+                        try:
+                            test.model = test.client.get_model(test.model_id)
+                            print_step("model", f"Fetched model details: {test.model.get('name', test.model_id)}")
+                        except Exception as e:
+                            print_error(f"Could not fetch model {test.model_id}: {e}")
+                            print("  Model may not exist or you may not have access")
+                            sys.exit(1)
                     
                     # train_model will check if already trained and skip if so
                     status = test.train_model(
@@ -1086,6 +1276,21 @@ def main() -> None:
                         horizon=args.forecast_horizon,
                         n_paths=args.n_paths,
                     )
+                    
+                    # Also run scenario forecast when starting from forecast stage
+                    # (to test conditional forecasting with historical scenarios)
+                    try:
+                        test.run_forecast_with_scenario(
+                            "Test Historical Scenario",
+                            "VIX Volatility Index",
+                            "2020-03-01",
+                            "2020-03-21",
+                            horizon=args.forecast_horizon,
+                            n_paths=args.n_paths,
+                        )
+                        print_success("Scenario forecast completed")
+                    except Exception as e:
+                        print_warning(f"Scenario forecast failed (optional): {e}")
                 
                 # Print IDs after each stage for easy resumption
                 print("\n  📋 Current state (use these to resume):")
