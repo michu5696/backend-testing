@@ -82,11 +82,22 @@ DEFAULT_TARGET_FEATURES: List[Dict[str, str]] = [
 
 def load_default_api_key() -> Optional[str]:
     """Load API key from standard locations."""
-    base_dir = Path(__file__).resolve().parents[1] / "backend" / "admin"
-    for candidate in ["admin_api_key_v2.txt", "admin_api_key.txt"]:
-        path = base_dir / candidate
+    project_root = Path(__file__).resolve().parents[1]
+    
+    # Check backend-ssm first (for v3)
+    backend_ssm_dir = project_root / "backend-ssm" / "admin"
+    for candidate in ["admin_api_key_v3.txt", "admin_api_key.txt"]:
+        path = backend_ssm_dir / candidate
         if path.exists():
             return path.read_text().strip()
+    
+    # Fallback to backend (for v2)
+    backend_dir = project_root / "backend" / "admin"
+    for candidate in ["admin_api_key_v2.txt", "admin_api_key.txt"]:
+        path = backend_dir / candidate
+        if path.exists():
+            return path.read_text().strip()
+    
     return None
 
 
@@ -130,8 +141,16 @@ class SSMPipelineClient:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         
-        # Long timeouts for training operations
-        timeout = httpx.Timeout(600.0, connect=30.0)
+        # Detect if local (synchronous training) or remote (async with polling)
+        is_local = "localhost" in api_url or "127.0.0.1" in api_url
+        
+        if is_local:
+            # No timeout for local synchronous training - it completes before returning
+            timeout = None
+        else:
+            # Long timeout for remote async requests (if needed)
+            timeout = httpx.Timeout(600.0, connect=30.0)
+        
         self.session = httpx.Client(
             base_url=self.api_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -337,6 +356,10 @@ class SSMPipelineClient:
         resp = self._request("GET", url)
         return resp.get("models", [])
     
+    def get_model(self, model_id: str) -> Dict[str, Any]:
+        """Get model details by ID."""
+        return self._request("GET", f"/api/v1/models/{model_id}")
+    
     def create_model(
         self,
         name: str,
@@ -389,7 +412,7 @@ class SSMPipelineClient:
         self,
         model_id: str,
         state_model: str = "gru",
-        generation_model: str = "gaussian",
+        generation_model: str = "flow",
         hidden_dim: Optional[int] = None,
         n_layers: int = 1,
         use_factors: bool = True,
@@ -397,8 +420,24 @@ class SSMPipelineClient:
         learning_rate: float = 1e-3,
         max_epochs: int = 100,
         batch_size: int = 32,
+        check_existing: bool = True,
     ) -> Dict[str, Any]:
         """Submit a training job."""
+        # Check if model is already trained (if check_existing enabled)
+        if check_existing:
+            try:
+                model = self.get_model(model_id)
+                status = model.get("status", "unknown")
+                if status == "trained":
+                    return {
+                        "status": "trained",
+                        "message": "Model already trained",
+                        "model_id": model_id,
+                    }
+            except Exception:
+                # If we can't check, proceed anyway
+                pass
+        
         payload = {
             "model_id": model_id,
             "state_model": state_model,
@@ -577,7 +616,7 @@ class SSMPipelineTest:
             self.training_end,
             self.fred_api_key,
         )
-        print_step("fetch", f"Conditioning: {result.get('features_fetched', 0)} features, {result.get('total_processed_points', 0)} points")
+        print_step("fetch", f"Conditioning: {result.get('features_processed', 0)} features, {result.get('total_data_points', 0)} points")
         
         # Fetch target data
         print_step("fetch", "Fetching target data...")
@@ -586,7 +625,7 @@ class SSMPipelineTest:
             self.training_start,
             self.training_end,
         )
-        print_step("fetch", f"Target: {result.get('features_fetched', 0)} features, {result.get('total_processed_points', 0)} points")
+        print_step("fetch", f"Target: {result.get('features_processed', 0)} features, {result.get('total_data_points', 0)} points")
         
         print_success("Data fetched successfully")
     
@@ -612,7 +651,7 @@ class SSMPipelineTest:
     def train_model(
         self,
         state_model: str = "gru",
-        generation_model: str = "gaussian",
+        generation_model: str = "flow",
         max_epochs: int = 50,
         poll_interval: int = 10,
         timeout: int = 0,
@@ -630,11 +669,14 @@ class SSMPipelineTest:
             state_model=state_model,
             generation_model=generation_model,
             max_epochs=max_epochs,
+            check_existing=False,  # Don't skip - user explicitly requested training
         )
-        print_step("train", f"Job submitted: status={result.get('status')}")
+        
+        status = result.get("status")
+        print_step("train", f"Job submitted: status={status}")
         
         # If training runs synchronously (local dev), it's already done
-        if result.get("status") == "trained":
+        if status == "trained":
             print_success("Training completed (synchronous)")
             return "trained"
         
@@ -717,7 +759,7 @@ class SSMPipelineTest:
         self,
         model_name: str,
         state_model: str = "gru",
-        generation_model: str = "gaussian",
+        generation_model: str = "flow",
         max_epochs: int = 50,
         poll_interval: int = 10,
         training_timeout: int = 0,
@@ -814,11 +856,19 @@ def parse_args() -> argparse.Namespace:
     # Test configuration
     parser.add_argument(
         "--stage",
-        choices=["all", "setup", "training", "forecast"],
+        choices=["all", "setup", "data_fetch", "model_creation", "training", "forecast"],
         default="all",
-        help="Which stage to run",
+        help="Which stage to START from (previous stages skipped if data exists)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Auto-detect and skip completed stages",
     )
     parser.add_argument("--model-id", help="Use existing model ID")
+    parser.add_argument("--project-id", help="Use existing project ID")
+    parser.add_argument("--conditioning-set-id", help="Use existing conditioning set ID")
+    parser.add_argument("--target-set-id", help="Use existing target set ID")
     parser.add_argument("--project-name", default="SSM Pipeline Test")
     parser.add_argument("--model-name", default="SSM Test Model")
     parser.add_argument("--training-start", default="2015-01-01")
@@ -834,7 +884,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--generation-model",
         choices=["gaussian", "flow", "copula"],
-        default="gaussian",
+        default="flow",
         help="Generation model type",
     )
     
@@ -859,11 +909,14 @@ def main() -> None:
     
     print_section("SSM Pipeline Test")
     print(f"API URL: {args.api_url}")
-    print(f"Stage: {args.stage}")
+    print(f"Stage: {args.stage}" + (" (resume mode)" if args.resume else ""))
     print(f"State Model: {args.state_model}")
     print(f"Generation Model: {args.generation_model}")
     
     client = SSMPipelineClient(args.api_url, args.api_key)
+    
+    # Define stage order and dependencies
+    STAGES = ["setup", "data_fetch", "model_creation", "training", "forecast"]
     
     try:
         test = SSMPipelineTest(
@@ -877,7 +930,60 @@ def main() -> None:
             args.model_id,
         )
         
+        # Auto-discover existing resources if not provided
+        # This makes resumption much easier - just run with --stage training
+        
+        # 1. Look up project by name
+        if not args.project_id:
+            try:
+                projects = client._request("GET", "/api/v1/projects")
+                for p in projects.get("projects", []):
+                    if p.get("name") == args.project_name:
+                        args.project_id = p["id"]
+                        print(f"  🔍 Found existing project: {args.project_id}")
+                        break
+            except Exception:
+                pass
+        
+        # 2. Look up feature sets from project
+        if args.project_id and (not args.conditioning_set_id or not args.target_set_id):
+            try:
+                feature_sets = client._request("GET", f"/api/v1/feature-sets?project_id={args.project_id}")
+                for fs in feature_sets.get("feature_sets", []):
+                    if fs.get("set_type") == "conditioning" and not args.conditioning_set_id:
+                        args.conditioning_set_id = fs["id"]
+                        print(f"  🔍 Found existing conditioning set: {args.conditioning_set_id}")
+                    elif fs.get("set_type") == "target" and not args.target_set_id:
+                        args.target_set_id = fs["id"]
+                        print(f"  🔍 Found existing target set: {args.target_set_id}")
+            except Exception:
+                pass
+        
+        # 3. Look up most recent model from project
+        if args.project_id and not args.model_id:
+            try:
+                models = client._request("GET", f"/api/v1/models?project_id={args.project_id}")
+                model_list = models.get("models", [])
+                if model_list:
+                    # Models are sorted by created_at DESC, so first is most recent
+                    args.model_id = model_list[0]["id"]
+                    print(f"  🔍 Found existing model (most recent): {args.model_id}")
+            except Exception:
+                pass
+        
+        # Apply discovered/provided IDs to test instance
+        if args.project_id:
+            test.project = {"id": args.project_id}
+        if args.conditioning_set_id:
+            test.conditioning_set = {"id": args.conditioning_set_id}
+        if args.target_set_id:
+            test.target_set = {"id": args.target_set_id}
+        if args.model_id:
+            test.model = {"id": args.model_id}
+            test.model_id = args.model_id
+        
         if args.stage == "all":
+            # Full pipeline
             results = test.run_full_pipeline(
                 args.model_name,
                 state_model=args.state_model,
@@ -902,39 +1008,95 @@ def main() -> None:
                 print_error("Some tests failed")
                 sys.exit(1)
         
-        elif args.stage == "setup":
-            test.setup_infrastructure()
-            test.fetch_data()
-            test.create_model(args.model_name)
-            print_success("Setup complete")
-        
-        elif args.stage == "training":
-            if not args.model_id:
-                # Need to set up first
-                test.setup_infrastructure()
-                test.fetch_data()
-                test.create_model(args.model_name)
+        else:
+            # Run from specific stage
+            start_idx = STAGES.index(args.stage)
             
-            status = test.train_model(
-                state_model=args.state_model,
-                generation_model=args.generation_model,
-                max_epochs=args.max_epochs,
-                poll_interval=args.poll_interval,
-                timeout=args.training_timeout,
-            )
-            
-            if status != "trained":
-                sys.exit(1)
-        
-        elif args.stage == "forecast":
-            if not args.model_id:
-                print_error("--model-id required for forecast stage")
-                sys.exit(1)
-            
-            test.run_forecast_unconditional(
-                horizon=args.forecast_horizon,
-                n_paths=args.n_paths,
-            )
+            for stage in STAGES[start_idx:]:
+                print_section(f"Running: {stage}")
+                
+                if stage == "setup":
+                    if test.project:
+                        print(f"  ⏭️  Skipping setup (project exists: {test.project['id']})")
+                    else:
+                        test.setup_infrastructure()
+                
+                elif stage == "data_fetch":
+                    # Check if we need to fetch data
+                    if test.conditioning_set and test.target_set:
+                        # Check if data already exists
+                        cs = client._request("GET", f"/api/v1/feature-sets/{test.conditioning_set['id']}")
+                        ts = client._request("GET", f"/api/v1/feature-sets/{test.target_set['id']}")
+                        if cs.get("fetched_data_available") and ts.get("fetched_data_available"):
+                            print("  ⏭️  Skipping data fetch (data already available)")
+                        else:
+                            test.fetch_data()
+                    else:
+                        # Need setup first
+                        if not test.project:
+                            test.setup_infrastructure()
+                        test.fetch_data()
+                
+                elif stage == "model_creation":
+                    if test.model:
+                        print(f"  ⏭️  Skipping model creation (model exists: {test.model['id']})")
+                    else:
+                        if not test.project or not test.conditioning_set or not test.target_set:
+                            print_error("Need project and feature sets for model creation")
+                            print("  Run with --stage setup or provide --project-id, --conditioning-set-id, --target-set-id")
+                            sys.exit(1)
+                        test.create_model(args.model_name)
+                
+                elif stage == "training":
+                    if not test.model:
+                        print_error("Need model for training. Provide --model-id or run earlier stages.")
+                        sys.exit(1)
+                    
+                    # train_model will check if already trained and skip if so
+                    status = test.train_model(
+                        state_model=args.state_model,
+                        generation_model=args.generation_model,
+                        max_epochs=args.max_epochs,
+                        poll_interval=args.poll_interval,
+                        timeout=args.training_timeout,
+                    )
+                    
+                    if status != "trained":
+                        print_error(f"Training failed with status: {status}")
+                        sys.exit(1)
+                
+                elif stage == "forecast":
+                    if not test.model_id:
+                        print_error("Need trained model for forecast. Provide --model-id or run earlier stages.")
+                        sys.exit(1)
+                    
+                    # Check if model is trained before forecasting (when starting from this stage)
+                    try:
+                        model = test.client.get_model(test.model_id)
+                        if model.get("status") != "trained":
+                            print_error(f"Model {test.model_id} is not trained (status: {model.get('status')})")
+                            print("  Run with --stage training to train the model first")
+                            sys.exit(1)
+                        print_success(f"Model {test.model_id} is trained - proceeding to forecast")
+                    except Exception as e:
+                        print_warning(f"Could not verify model status: {e}")
+                        print("  Proceeding with forecast anyway...")
+                    
+                    test.run_forecast_unconditional(
+                        horizon=args.forecast_horizon,
+                        n_paths=args.n_paths,
+                    )
+                
+                # Print IDs after each stage for easy resumption
+                print("\n  📋 Current state (use these to resume):")
+                if test.project:
+                    print(f"     --project-id {test.project['id']}")
+                if test.conditioning_set:
+                    print(f"     --conditioning-set-id {test.conditioning_set['id']}")
+                if test.target_set:
+                    print(f"     --target-set-id {test.target_set['id']}")
+                if test.model:
+                    print(f"     --model-id {test.model['id']}")
     
     finally:
         client.close()
