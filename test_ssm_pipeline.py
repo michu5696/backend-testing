@@ -149,6 +149,8 @@ def _plot_forecast_paths(
         n_paths_to_plot: Number of individual paths to plot
         scenario_name: Name for the plot title
     """
+    print(f"[PLOT] Starting plot for feature: {feature_name}")
+    
     if plt is None or pd is None:
         print_warning("matplotlib or pandas not available; skipping plot")
         return
@@ -190,8 +192,117 @@ def _plot_forecast_paths(
     except:
         dates = np.arange(len(mean_vals))
     
+    # Get historical context if available
+    historical_context = forecast_result.get('historical_context', {})
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    print(f"[DEBUG] Historical context keys: {list(historical_context.keys()) if historical_context else 'None'}")
+    print(f"[DEBUG] Looking for feature: {feature_name}")
+    
+    hist_data = None
+    hist_dates = None
+    hist_dates_raw = None
+    
+    # Try exact match first
+    if historical_context and feature_name in historical_context:
+        hist_feat = historical_context[feature_name]
+        print(f"[DEBUG] Found historical data for {feature_name}: type={type(hist_feat)}")
+        
+        if isinstance(hist_feat, dict) and 'values' in hist_feat and 'dates' in hist_feat:
+            hist_data = hist_feat['values']
+            hist_dates_raw = hist_feat['dates']
+            print(f"[DEBUG] Historical data: {len(hist_data)} values, {len(hist_dates_raw)} dates")
+            try:
+                hist_dates = pd.to_datetime(hist_dates_raw)
+                print(f"[DEBUG] Successfully parsed {len(hist_dates)} historical dates")
+            except Exception as e:
+                print(f"[WARNING] Failed to parse historical dates: {e}")
+                hist_dates = None
+        elif isinstance(hist_feat, list):
+            hist_data = hist_feat
+            hist_dates = None
+            hist_dates_raw = None
+            print(f"[DEBUG] Historical data as list: {len(hist_data)} values")
+    else:
+        # Try case-insensitive or partial match
+        if historical_context:
+            for key in historical_context.keys():
+                if key.lower() == feature_name.lower() or feature_name.lower() in key.lower():
+                    print(f"[DEBUG] Found approximate match: '{key}' for '{feature_name}'")
+                    hist_feat = historical_context[key]
+                    if isinstance(hist_feat, dict) and 'values' in hist_feat and 'dates' in hist_feat:
+                        hist_data = hist_feat['values']
+                        hist_dates_raw = hist_feat['dates']
+                        try:
+                            hist_dates = pd.to_datetime(hist_dates_raw)
+                        except:
+                            hist_dates = None
+                    break
+        
+        if not hist_data:
+            print(f"[WARNING] No historical context found for {feature_name}. Available keys: {list(historical_context.keys()) if historical_context else 'None'}")
+    
     # Create plot
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, ax = plt.subplots(figsize=(16, 7))
+    
+    # Plot historical data if available - ALWAYS plot if we have data
+    has_history = False
+    if hist_data and len(hist_data) > 0:
+        print(f"[PLOT] Attempting to plot {len(hist_data)} historical data points")
+        
+        # Strategy: Always try to plot with dates, fall back if needed
+        plotted = False
+        
+        # Try 1: Use parsed dates if they match
+        if hist_dates is not None and len(hist_data) == len(hist_dates):
+            try:
+                ax.plot(hist_dates, hist_data, 'k-', linewidth=2.5, label='Historical', alpha=0.8, zorder=3)
+                has_history = True
+                plotted = True
+                print(f"[PLOT] ✓ Plotted {len(hist_data)} historical points with parsed dates")
+            except Exception as e:
+                print(f"[PLOT] Failed to plot with parsed dates: {e}")
+        
+        # Try 2: Generate date range from forecast dates
+        if not plotted and dates_raw and len(dates_raw) > 0:
+            try:
+                forecast_dates = pd.to_datetime(dates_raw)
+                first_forecast_date = forecast_dates[0]
+                # Generate historical dates going back from first forecast date
+                hist_date_range = pd.date_range(end=first_forecast_date, periods=len(hist_data), freq='B')  # Business days
+                ax.plot(hist_date_range, hist_data, 'k-', linewidth=2.5, label='Historical', alpha=0.8, zorder=3)
+                has_history = True
+                plotted = True
+                print(f"[PLOT] ✓ Plotted {len(hist_data)} historical points with generated date range")
+            except Exception as e:
+                print(f"[PLOT] Failed to generate date range: {e}")
+        
+        # Try 3: Use raw date strings if available
+        if not plotted and hist_dates_raw and len(hist_dates_raw) == len(hist_data):
+            try:
+                hist_dates_parsed = pd.to_datetime(hist_dates_raw)
+                ax.plot(hist_dates_parsed, hist_data, 'k-', linewidth=2.5, label='Historical', alpha=0.8, zorder=3)
+                has_history = True
+                plotted = True
+                print(f"[PLOT] ✓ Plotted {len(hist_data)} historical points from raw date strings")
+            except Exception as e:
+                print(f"[PLOT] Failed to parse raw dates: {e}")
+        
+        # Add vertical line to separate history from forecast
+        if has_history and dates_raw and len(dates_raw) > 0:
+            try:
+                first_forecast_date = pd.to_datetime(dates_raw[0])
+                ax.axvline(x=first_forecast_date, color='black', linestyle='--', alpha=0.6, linewidth=2, zorder=2, label='Forecast Start')
+                print(f"[PLOT] ✓ Added separator line at {first_forecast_date}")
+            except Exception as e:
+                print(f"[PLOT] Could not add separator line: {e}")
+        
+        if not plotted:
+            print(f"[WARNING] Historical data exists ({len(hist_data)} points) but could not be plotted with any method!")
+        
+        if has_history:
+            print_step("plot", f"Plotted {len(hist_data)} historical data points")
     
     # Plot individual paths (if available)
     paths_data = forecast_result.get('paths', {})
